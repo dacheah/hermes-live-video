@@ -1,0 +1,22 @@
+node_modules
+node_modules/
+npm-debug.log*
+
+# Local test artefacts (not part of the relay)
+public/probe.wav
+public/hermes-live-client.js
+
+# Runtime artefacts: logs, transcripts, pid files
+*.log
+*.log.*
+data/
+
+# Deployment-specific identity and credentials
+persona.txt
+config.env
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/

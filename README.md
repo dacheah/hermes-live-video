@@ -1,0 +1,171 @@
+# Hermes Live Video
+
+**Point your phone at the room, talk to your agent, and let it see.**
+
+Live Video gives Hermes a duplex voice conversation with a camera attached. Open a
+page on your phone, speak normally, and the agent answers in under a second while
+watching the feed. When you ask it to tell you that something has come into view, it
+checks the frames and speaks the moment it appears — then goes quiet again.
+
+The plugin is the control surface. The relay beside it is the capability: a Node
+service that carries the audio, streams frames to Gemini Live, runs a local
+frame-change tracker, and verifies sightings with a second model.
+
+```
+  phone browser ── audio + frames ──► relay (Node, :8098) ──► Gemini Live (duplex voice)
+                                          │
+                                          ├── vision_tracker.py   "has the scene changed?"
+                                          └── watch verifier      "is the thing there yet?"
+                                                    │
+  you ── "let me know when …" ─────────────────────┘
+                                                    │
+                            agent speaks: "The blue screen is showing now, sir."
+```
+
+## What it actually does
+
+- **Duplex voice, sub-second.** Model audio streams back while you speak; measured
+  first-token latency on a modest VPS was 0.57 s and 1.03 s across two turns.
+- **Sees, and says what it sees.** Ask "describe what you're seeing" and the agent
+  answers from the current frame — a white desk, a blue globe, a toy car — and it is
+  instructed to say plainly when it cannot see, rather than inventing detail.
+- **Watch mode.** "Let me know when the kettle boils" arms a 90-second window. The
+  relay looks at the view every few seconds and, on a sighting, asks the model to say
+  so. If nothing appears, it asks whether to keep watching. One scene is described
+  once, not once per glance.
+- **A transcript you can review.** Every session writes `transcript.log`; the plugin
+  turns it into counts, turns, watch receipts and verifier latencies, so you can ask
+  your agent afterwards what happened.
+
+## Why this is a plugin and not a skill
+
+A skill could describe this workflow. It could not carry 16 kHz audio in both
+directions, run a change detector on 224×224 frames at four frames a second, hold a
+90-second window open across conversational turns, or verify a sighting against the
+image before claiming it. That is real-time code on both sides of the conversation,
+which is the point of the plugin system.
+
+## Requirements
+
+| Piece | Needs |
+|---|---|
+| Relay | Node.js 18+ (`ws`) |
+| Frame tracker | Python 3 with `numpy`, `Pillow`, `torch` (CPU is fine; no model download) |
+| Model | A Gemini API key with access to `gemini-3.8-live`; watch mode verifies with `gemini-3-flash-preview` |
+
+On the free tier, `gemini-3-flash` allows **20 generate-content requests per day per
+project**, which one 90-second watch can exhaust. Watch mode realistically wants a
+billing-enabled key; without it, the relay spends its budget, says so in the log, and
+stops asking.
+
+## Install
+
+```bash
+git clone https://github.com/dacheah/hermes-live-video
+cd hermes-live-video
+npm install
+python3 -m pip install numpy pillow torch
+```
+
+Copy the plugin into your Hermes plugin directory and enable it:
+
+```bash
+cp -r plugin ~/.hermes/plugins/live-video
+hermes plugins enable live-video
+hermes secrets set GEMINI_API_KEY                  # the plugin passes it to the relay
+```
+
+Then, in a Hermes session:
+
+> **You:** start live video
+>
+> **Hermes:** *(live_video → start)* Relay is up on port 8098 — open
+> `http://192.168.1.24:8098/` on your phone and press Start.
+
+Open the URL on a phone on the same network, allow the microphone and camera, and
+press **Start**. Use HTTPS (a tunnel in front of the relay) if you want to reach it
+away from home; browsers only grant camera access on secure origins.
+
+## The tool
+
+One tool, six actions:
+
+| Action | What it does |
+|---|---|
+| `start` | Launch the relay if it is not already up; returns local and LAN URLs, pid and health |
+| `stop` | Stop a relay this plugin started (a systemd-run relay is left to systemd, and `stop` says so) |
+| `url` | The address to open on the phone, plus health |
+| `status` | Relay health, service state, tracker processes, watch state |
+| `session` | Recent transcript: counts by tag, window, user turns and replies |
+| `checks` | Watch verifier behaviour, grouped per armed window: triggers, verdicts, latencies |
+
+`start` reads `GEMINI_API_KEY` through Hermes' secret scope and hands it to the child
+in its environment. It never writes the key to disk. A relay you run yourself as a
+service keeps running its own way — the plugin does not restart, reconfigure or
+attach to it.
+
+## Configuration
+
+Everything is optional; the defaults assume `~/hermes-live-video` and port 8098.
+
+```yaml
+plugins:
+  entries:
+    live-video:
+      relay_dir: ~/hermes-live-video   # where server.js lives
+      port: 8098
+      bind: 0.0.0.0                    # 127.0.0.1 behind your own tunnel
+      node_bin: ""                     # default: node on PATH, else Hermes' bundled node
+      unit: hermes-live-video          # systemd user unit, if you run it as one
+      window_s: 90                     # watch window length used when reading logs
+```
+
+Relay-side tuning lives in the environment, not the source:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `LIVE_USER_NAME` | `the user` | Name used in relay-injected context |
+| `LIVE_USER_ADDRESS` | `sir` | How the agent addresses you |
+| `LIVE_SYSTEM_PROMPT_FILE` | — | Path to a text file with the full system instruction |
+| `WATCH_WINDOW_SECONDS` | `90` | Watch window |
+| `WATCH_HEARTBEAT_MS` | `5000` | Re-check interval; `0` disables heartbeat checks |
+| `WATCH_MAX_CHECKS` | `18` | Verifier calls per window (the spend cap) |
+| `WATCH_VERIFIER_MODELS` | `gemini-3-flash-preview` | Comma-separated verifier models |
+
+## What goes over the network
+
+Audio and video go from your phone to the relay, and from the relay to Google's
+Gemini Live endpoint. Watch-mode frames go to the verifier model, also Google. Nothing
+else leaves the machine: no telemetry, no analytics, no updates fetched at runtime.
+The relay reads its key from `GEMINI_API_KEY` or its own `config.env` — never from
+another application's credential store.
+
+If you expose the relay beyond your network, put authentication in front of it. An
+open relay spends its owner's key: the page takes camera frames and starts model
+sessions for anyone who finds it.
+
+## Honest limits
+
+- The frame tracker is a **change detector**, not an object detector. It answers
+  "has the view changed enough to look?" with a seeded random-projection sketch, and
+  leaves "is the thing there?" to the verifier model. With the heartbeat disabled it
+  can only react to a change large enough to move the sketch — a small object
+  arriving in a still scene is the case it misses.
+- The verifier is slow: 3–7 seconds per look in testing. A sighting is voiced a few
+  seconds after it appears, not instantly.
+- One watch window at a time, 90 seconds by default, with a per-window check cap.
+- The tracker needs PyTorch. It downloads no weights, but the dependency is large.
+
+## Tests
+
+```bash
+python3 plugin/tests/test_handlers.py   # 21 tests, stdlib only
+hermes plugins validate plugin          # manifest, capabilities, security scan
+```
+
+Fixtures are real relay log lines, not synthesised ones, so a parser that stops
+matching fails a test instead of returning an empty answer.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

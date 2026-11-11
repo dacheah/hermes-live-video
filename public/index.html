@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>JARVIS Live Video</title>
+  <style>
+    :root {
+      --bg: #0d1117;
+      --fg: #c9d1d9;
+      --accent: #58a6ff;
+      --card: #161b22;
+      --border: #30363d;
+      --danger: #f85149;
+      --success: #3fb950;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--fg);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+      height: 100dvh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: space-between;
+      padding: 16px;
+      overflow: hidden;
+    }
+    header {
+      width: 100%;
+      max-width: 600px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+    }
+    h1 { font-size: 1.1rem; font-weight: 600; letter-spacing: 1px; color: var(--accent); text-transform: uppercase; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.8rem;
+      padding: 4px 10px;
+      border-radius: 14px;
+      background: var(--border);
+      color: var(--fg);
+      font-weight: 600;
+      letter-spacing: 0.3px;
+      transition: all 0.2s ease;
+    }
+    .status-dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      margin-right: 6px;
+      background: #8b949e;
+      flex-shrink: 0;
+    }
+    .badge.listening { background: rgba(63, 185, 80, 0.2); color: var(--success); border: 1px solid var(--success); }
+    .badge.listening .status-dot { background: var(--success); }
+    .badge.listening.receiving { background: rgba(63, 185, 80, 0.35); box-shadow: 0 0 10px rgba(63, 185, 80, 0.4); }
+    .badge.listening.receiving .status-dot {
+      background: #3fb950;
+      box-shadow: 0 0 8px #3fb950;
+      animation: pulse-green 0.7s infinite alternate;
+    }
+    .badge.thinking { background: rgba(234, 179, 8, 0.2); color: #eab308; border: 1px solid #eab308; }
+    .badge.thinking .status-dot {
+      background: #eab308;
+      box-shadow: 0 0 8px #eab308;
+      animation: pulse-amber 0.9s infinite alternate;
+    }
+    .badge.speaking { background: rgba(88, 166, 255, 0.2); color: var(--accent); border: 1px solid var(--accent); }
+    .badge.speaking .status-dot {
+      background: var(--accent);
+      box-shadow: 0 0 10px var(--accent);
+      animation: pulse-blue 0.6s infinite alternate;
+    }
+    @keyframes pulse-green {
+      from { transform: scale(0.85); opacity: 0.7; }
+      to { transform: scale(1.35); opacity: 1; }
+    }
+    @keyframes pulse-amber {
+      from { transform: scale(0.85); opacity: 0.6; }
+      to { transform: scale(1.3); opacity: 1; }
+    }
+    @keyframes pulse-blue {
+      from { transform: scale(0.85); opacity: 0.6; }
+      to { transform: scale(1.35); opacity: 1; }
+    }
+    .subtitles-container {
+      position: absolute;
+      bottom: 14px;
+      left: 12px;
+      right: 12px;
+      background: rgba(13, 17, 23, 0.85);
+      backdrop-filter: blur(8px);
+      border: 1px solid rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 10px 14px;
+      font-size: 0.9rem;
+      line-height: 1.4;
+      color: #fff;
+      min-height: 48px;
+      max-height: 120px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-start;
+      pointer-events: none;
+      z-index: 10;
+    }
+    .subtitles-role {
+      font-size: 0.72rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 2px;
+    }
+    .role-user { color: #58a6ff; }
+    .role-jarvis { color: #3fb950; }
+    .subtitles-text {
+      word-wrap: break-word;
+    }
+    .viewport-container {
+      position: relative;
+      width: 100%;
+      max-width: 600px;
+      flex: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #000;
+      border-radius: 16px;
+      overflow: hidden;
+      border: 1px solid var(--border);
+      margin: 12px 0;
+    }
+    video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+    .overlay-status {
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      background: rgba(0, 0, 0, 0.6);
+      backdrop-filter: blur(4px);
+      padding: 6px 12px;
+      border-radius: 8px;
+      font-size: 0.8rem;
+      font-family: monospace;
+    }
+    .controls {
+      width: 100%;
+      max-width: 600px;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    button {
+      background: var(--card);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      padding: 14px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      border-radius: 12px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    button:active { background: var(--border); }
+    button.primary { background: var(--accent); color: #0d1117; border-color: var(--accent); }
+    button.danger { background: var(--danger); color: #fff; border-color: var(--danger); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>JARVIS Live Vision</h1>
+    <span id="status-badge" class="badge"><span class="status-dot"></span><span id="status-text">Standby</span></span>
+  </header>
+
+  <div class="viewport-container">
+    <video id="preview" autoplay playsinline muted></video>
+    <div id="overlay" class="overlay-status">Tap Start to Connect</div>
+    <div id="subtitles" class="subtitles-container" style="display: none;">
+      <span id="subtitles-role" class="subtitles-role"></span>
+      <span id="subtitles-text" class="subtitles-text"></span>
+    </div>
+  </div>
+
+  <div class="controls">
+    <button id="toggle-cam">Flip Camera</button>
+    <button id="start-btn" class="primary">Start Session</button>
+  </div>
+
+  <script src="/client.js?v=12"></script>
+</body>
+</html>

@@ -25,15 +25,30 @@ One tool, `live_video`, six actions:
 
 Nothing here joins the relay's audio path or reconfigures it.
 
-## Watch mode and the free-tier quota
+## Watch mode and how a check is answered
 
-The relay verifies a watch with `gemini-3-flash-preview`. On the **free tier that
-model allows 20 generate-content calls per day, per project**, and a 90-second watch
-at a 5-second heartbeat asks for 18. A 429 carries its own retry hint and the relay
-honours it: one rate-limited request, then no further calls until the hint expires,
-each blocked check logged as `rate limited` rather than stalling twice for 8 s.
+A watch asks one question — is the thing you named in frame now? — and answers it by
+opening a **short Live session** (`lib/verifier.js`, mode `live`), sending the frame and
+a one-line question, and reading the reply. The same model that is already holding the
+frames answers, so a check costs no extra REST quota, and it measured **0.8–3.3 s** per
+verdict against 3.1–6.9 s through generate-content.
 
-On a free key, cap the cost with a systemd drop-in:
+`auto` is the default: live first, then one generate-content call if the live transport
+fails. `generate` pins the REST path; `live` pins the Live path. A 429 carries its own
+retry hint, which is honoured — one rate-limited request, then no further calls until
+the hint expires, each blocked check logged as `rate limited` rather than stalling twice.
+
+Every check is stamped into the transcript as well as stdout, because `server.log` has
+no clocks and a check cannot otherwise be attributed to the window it belongs to:
+
+```
+[2026-11-12T16:03:32.874Z] WATCH_CHECK: n=1 trigger=scene change verdict=visible model=live ms=1126
+```
+
+`checks` returns those per window, including an `events` array that names the transport
+behind each verdict.
+
+On a free key, cap the spend with a systemd drop-in:
 
 ```
 ~/.config/systemd/user/hermes-live-video.service.d/quota-free-tier.conf
@@ -45,12 +60,9 @@ Delete it and `systemctl --user daemon-reload` once the key is billed. The start
 states the live configuration on every restart:
 
 ```
-[live-video] watch mode: window=90s settle=1000ms heartbeat=disabled (scene change only) max_checks=3
+[live-video] watch mode: window=90s settle=1000ms heartbeat=disabled (scene change only)
+             max_checks=3 verifier=auto(gemini-3-flash-preview) live=models/gemini-3.8-live
 ```
-
-Paid-tier cost, measured rather than assumed: 1,136 prompt tokens per check, one-word
-answer, `gemini-3-flash-preview` at $0.50/1M input and $3.00/1M output — **$0.00058 per
-check**, about a cent per 90-second watch at the 18-check ceiling.
 
 ## Config
 
@@ -87,7 +99,7 @@ setting to change, rather than an empty result.
 ## Tests
 
 ```bash
-cd plugin && python3 tests/test_handlers.py    # 21 tests, stdlib only
+cd plugin && python3 tests/test_handlers.py    # 25 tests, stdlib only
 hermes plugins validate .                     # manifest, capabilities, security scan
 ```
 

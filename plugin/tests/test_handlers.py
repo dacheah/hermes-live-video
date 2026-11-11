@@ -39,6 +39,68 @@ SERVER_LOG = """\
 """
 
 
+class TranscriptChecks(unittest.TestCase):
+    """A relay that stamps WATCH_CHECK lines: the transcript dates every check.
+
+    server.log is deliberately populated with a different session's checks, so a
+    parser that preferred stdout would report the wrong latency here.
+    """
+
+    TRANSCRIPT = """\
+[2026-11-12T16:03:15.400Z] USER: Let me know when the screen turns blue.
+[2026-11-12T16:03:15.402Z] WATCH_ARMED: Let me know when the screen turns blue.
+[2026-11-12T16:03:17.930Z] JARVIS: Understood, sir. I shall keep watch.
+[2026-11-12T16:03:30.747Z] VISION_EVENT: Significant visual change (dist=0.7391)
+[2026-11-12T16:03:32.874Z] WATCH_CHECK: n=1 trigger=scene change verdict=visible model=live ms=1126
+[2026-11-12T16:03:32.874Z] WATCH_FIRED: visible (check 1, 1126ms)
+"""
+
+    SERVER_LOG = """\
+[live-video] watch armed for 90s: let me know when the screen turns blue
+[live-video] watch check 1 (heartbeat): not yet — gemini-3-flash-preview 4542ms
+[live-video] watch check 2 (heartbeat): not yet — gemini-3-flash-preview 3432ms
+[live-video] watch check 3 (scene change): VISIBLE — gemini-3-flash-preview 4542ms
+"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "transcript.log").write_text(self.TRANSCRIPT)
+        (self.root / "server.log").write_text(self.SERVER_LOG)
+        os.environ["LIVE_VIDEO_RELAY_DIR"] = str(self.root)
+        os.environ["LIVE_VIDEO_PORT"] = "9"
+
+    def tearDown(self):
+        os.environ.pop("LIVE_VIDEO_RELAY_DIR", None)
+        os.environ.pop("LIVE_VIDEO_PORT", None)
+        self.tmp.cleanup()
+
+    def call(self, **args):
+        return json.loads(tools.handle_live_video({"action": "checks", **args}))
+
+    def test_transcript_checks_win_over_stdout(self):
+        out = self.call()
+        self.assertEqual(out["windows_count"], 1)
+        window = out["windows"][0]
+        self.assertEqual(window["checks"], 1)
+        self.assertEqual(window["by_trigger"], {"scene change": 1})
+        self.assertEqual(window["latency_ms"]["median"], 1126)
+        self.assertEqual(window["outcome"], "sighted")
+
+    def test_armed_sentence_survives_without_a_window_in_the_line(self):
+        window = self.call()["windows"][0]
+        self.assertEqual(window["sentence"], "Let me know when the screen turns blue.")
+        self.assertEqual(window["window_s"], 90)
+
+    def test_live_transport_is_reported_as_the_model(self):
+        events = self.call()["windows"][0]["events"]
+        self.assertEqual(events[0]["model"], "live")
+
+    def test_since_still_filters_transcript_windows(self):
+        self.assertEqual(self.call(since="2026-11-12T16:00:00Z")["windows_count"], 1)
+        self.assertEqual(self.call(since="2026-11-12T17:00:00Z")["windows_count"], 0)
+
+
 class Handlers(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

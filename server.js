@@ -5,6 +5,7 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer, WebSocket } = require('ws');
+const { createVerifier } = require('./lib/verifier');
 
 const PORT = Number(process.env.PORT || 8098);
 const HOST = process.env.HOST || '127.0.0.1';
@@ -137,6 +138,21 @@ const WATCH_CONTINUE = /^(?:yes|yeah|yep|sure|please|okay|ok|go on|keep (?:watch
 const VERIFIER_MODELS = (process.env.WATCH_VERIFIER_MODELS || 'gemini-3-flash-preview').split(',');
 const VERIFIER_TIMEOUT_MS = Number(process.env.WATCH_VERIFIER_TIMEOUT_MS || 8000);
 
+// Watch verification runs on the Live session by default: the same model already
+// holds the frames, it answers in 0.8–3.3 s, and it draws on a different quota
+// from generateContent, which the free tier rations to 20 calls a day.
+// 'live' | 'generate' | 'auto' (live first, generate as the fallback).
+const WATCH_VERIFIER_MODE = (process.env.WATCH_VERIFIER_MODE || 'auto').toLowerCase();
+const LIVE_MODEL = process.env.LIVE_MODEL || 'models/gemini-3.8-live';
+const verifier = createVerifier({
+  getApiKey,
+  mode: ['live', 'generate', 'auto'].includes(WATCH_VERIFIER_MODE) ? WATCH_VERIFIER_MODE : 'auto',
+  models: VERIFIER_MODELS,
+  liveModel: LIVE_MODEL,
+  timeoutMs: VERIFIER_TIMEOUT_MS,
+  log: console
+});
+
 const MIME = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -261,47 +277,16 @@ server.on('upgrade', (req, socket, head) => {
       watch.timer = setTimeout(() => evaluateWatch('scene change'), WATCH_SETTLE_MS);
     }
 
-    async function askVerifier(sentence, frameB64, timeoutMs) {
-      const prompt = `You are a visual verifier for a live camera feed. The user asked to be told when: "${sentence}"\n` +
-        'Look only at this image. Answer with exactly one word, nothing else:\n' +
-        'YES - the thing asked about is visible in this image now\n' +
-        'NO - it is not visible in this image';
-      const body = JSON.stringify({
-        contents: [{ role: 'user', parts: [{ text: prompt }, { inlineData: { mimeType: 'image/jpeg', data: frameB64 } }] }],
-        generationConfig: { temperature: 0, maxOutputTokens: 256, thinkingConfig: { thinkingBudget: 0 } }
-      });
-      for (const model of VERIFIER_MODELS) {
-        const ctrl = new AbortController();
-        const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-        const started = Date.now();
-        try {
-          const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
-            method: 'POST',
-            headers: { 'x-goog-api-key': getApiKey(), 'content-type': 'application/json' },
-            body,
-            signal: ctrl.signal
-          });
-          clearTimeout(timer);
-          if (res.status === 429) {
-            const body = await res.json().catch(() => null);
-            const wait = retryDelayMs(body) ?? 120000;
-            verifierBlockedUntil = Date.now() + Math.min(wait, 600000);
-            console.warn(`[live-video] verifier rate limited — next look in ${Math.round((verifierBlockedUntil - Date.now()) / 1000)}s`);
-            return { rateLimited: true };
-          }
-          if (!res.ok) {
-            console.warn(`[live-video] verifier ${model} HTTP ${res.status}`);
-            continue;
-          }
-          const json = await res.json();
-          const text = (json.candidates?.[0]?.content?.parts || []).map(p => p.text || '').join('').trim().toUpperCase();
-          return { visible: text.startsWith('YES'), ms: Date.now() - started, model, text };
-        } catch (err) {
-          clearTimeout(timer);
-          console.warn(`[live-video] verifier ${model} failed: ${err.message}`);
-        }
+    // The verifier now lives in lib/verifier.js so it can be tested directly.
+    // This wrapper keeps the watch loop's logging and rate-limit state exactly
+    // as they were, and translates a 429 into the block the loop honours.
+    async function askVerifier(sentence, frameB64) {
+      const result = await verifier.look(sentence, frameB64);
+      if (result && result.rateLimited) {
+        verifierBlockedUntil = Date.now() + Math.min(result.waitMs ?? 120000, 600000);
+        console.warn(`[live-video] verifier rate limited — next look in ${Math.round((verifierBlockedUntil - Date.now()) / 1000)}s`);
       }
-      return null;
+      return result;
     }
 
     async function evaluateWatch(trigger) {
@@ -338,7 +323,7 @@ server.on('upgrade', (req, socket, head) => {
       const frame = lastFrameB64;
       let result = null;
       try {
-        result = await askVerifier(sentence, frame, VERIFIER_TIMEOUT_MS);
+        result = await askVerifier(sentence, frame);
       } finally {
         if (watch) {
           watch.evalBusy = false;
@@ -350,13 +335,18 @@ server.on('upgrade', (req, socket, head) => {
       }
       if (result && result.rateLimited) {
         console.log(`[live-video] watch check ${checkNo} (${trigger}): rate limited`);
+        appendTranscript(`WATCH_CHECK: n=${checkNo} trigger=${trigger} verdict=rate_limited model=none ms=0`);
         return;
       }
       if (!result) {
         console.log(`[live-video] watch check ${checkNo} (${trigger}): verifier unavailable`);
+        appendTranscript(`WATCH_CHECK: n=${checkNo} trigger=${trigger} verdict=unavailable model=none ms=0`);
         return;
       }
       console.log(`[live-video] watch check ${checkNo} (${trigger}): ${result.visible ? 'VISIBLE' : 'not yet'} — ${result.model} ${result.ms}ms`);
+      // Stamped into the transcript as well as stdout: server.log has no clocks,
+      // so per-window receipts can only be attributed reliably from here.
+      appendTranscript(`WATCH_CHECK: n=${checkNo} trigger=${trigger} verdict=${result.visible ? 'visible' : 'not_yet'} model=${result.model} ms=${result.ms}`);
       if (result.visible && watch && !watch.fired) {
         fireWatch(result, checkNo);
       }
@@ -432,7 +422,7 @@ server.on('upgrade', (req, socket, head) => {
       console.log('[live-video] upstream connected to Gemini Live API, sending setup frame...');
       const setup = {
         setup: {
-          model: 'models/gemini-3.8-live',
+          model: LIVE_MODEL,
           generationConfig: {
             responseModalities: ['AUDIO'],
             speechConfig: {
@@ -638,5 +628,5 @@ server.listen(PORT, HOST, () => {
   console.log(`[live-video] listening on http://${HOST}:${PORT}`);
   console.log(`[live-video] watch mode: window=${WATCH_WINDOW_SECONDS}s settle=${WATCH_SETTLE_MS}ms ` +
     `heartbeat=${WATCH_HEARTBEAT_MS > 0 ? WATCH_HEARTBEAT_MS + 'ms' : 'disabled (scene change only)'} ` +
-    `max_checks=${WATCH_MAX_CHECKS} verifier=${VERIFIER_MODELS.join(',')}`);
+    `max_checks=${WATCH_MAX_CHECKS} verifier=${WATCH_VERIFIER_MODE}(${VERIFIER_MODELS.join(',')}) live=${LIVE_MODEL}`);
 });

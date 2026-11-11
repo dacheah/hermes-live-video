@@ -72,7 +72,24 @@ CHECK_RE = re.compile(
     r"watch check (?P<n>\d+) \((?P<trigger>[^)]+)\): (?P<verdict>VISIBLE|not yet|verifier unavailable|pre-empted|rate limited)"
     r"(?: — (?P<model>[\w.\-]+) (?P<ms>\d+)ms)?"
 )
+# The relay stamps every check into the transcript as well as stdout, because
+# server.log carries no clocks: without a stamp, checks from different sessions
+# cannot be attributed to the window they belong to.
+WATCH_CHECK_RE = re.compile(
+    r"WATCH_CHECK: n=(?P<n>\d+) trigger=(?P<trigger>.+?) verdict=(?P<verdict>visible|not_yet|unavailable|rate_limited|pre_empted)"
+    r" model=(?P<model>\S+) ms=(?P<ms>\d+)"
+)
+VERDICT_WORDS = {
+    "visible": "VISIBLE",
+    "not_yet": "not yet",
+    "unavailable": "verifier unavailable",
+    "rate_limited": "rate limited",
+    "pre_empted": "pre-empted",
+}
 ARMED_RE = re.compile(r"watch armed for (?P<window>\d+)s: (?P<sentence>.+)$")
+# The transcript spells it differently and carries no window length: the window
+# comes from configuration, which is what armed it in the first place.
+TRANSCRIPT_ARMED_RE = re.compile(r"^WATCH_ARMED: (?P<sentence>.+)$")
 ENDED_RE = re.compile(r"watch ended without a sighting: (?P<reason>.+)$")
 
 SCHEMA = {
@@ -547,6 +564,9 @@ def _summarise(items):
     latencies = [c["ms"] for c in items if c.get("ms")]
     return {
         "checks": len(items),
+        # The individual receipts stay available: which transport answered each
+        # check is the difference between a live verdict and a paid REST call.
+        "events": [dict(c) for c in items],
         "visible": sum(1 for c in items if c["verdict"] == "VISIBLE"),
         "not_yet": sum(1 for c in items if c["verdict"] == "not yet"),
         "verifier_unavailable": sum(1 for c in items if c["verdict"] == "verifier unavailable"),
@@ -609,19 +629,62 @@ def _match_stamp(sentence, armed):
     return None
 
 
-def handle_checks(args, **_kw):
-    """Verifier behaviour, grouped by the watch window each check belongs to.
+def _checks_from_transcript(cfg):
+    """Watch windows and their checks, read from the timestamped transcript.
 
-    Grouping matters: a single flat list mixes every session in the log, so a
-    review has to count backwards by hand to find which checks belong to the
-    watch under discussion. A window starts at WATCH_ARMED and is closed by a
-    sighting or by the disarm line.
+    Returns [] when the relay has not written any WATCH_CHECK lines (older runs,
+    or a relay predating that line), so the caller can fall back to server.log.
     """
-    cfg = config()
-    path = _relay_dir(cfg) / "server.log"
+    path = _relay_dir(cfg) / "transcript.log"
     if not path.exists():
-        return json.dumps({"ok": False, "action": "checks", "error": _no_relay(path, "server log")})
-    since = _parse_ts(args.get("since")) if args.get("since") else None
+        return []
+    windows = []
+    current = None
+    for line in _tail(path, 4000):
+        m = TRANSCRIPT_RE.match(line.strip())
+        if not m:
+            continue
+        stamp, rest = m.group("ts"), m.group("rest")
+        armed = ARMED_RE.search(rest) or TRANSCRIPT_ARMED_RE.search(rest)
+        if armed:
+            sentence = armed.groupdict().get("sentence")
+            window = armed.groupdict().get("window")
+            current = {
+                "armed_at": stamp,
+                "sentence": (sentence or "").strip() or None,
+                "window_s": int(window) if window else int(cfg.get("window_s") or 90),
+                "checks": [],
+                "outcome": "open",
+            }
+            windows.append(current)
+            continue
+        check = WATCH_CHECK_RE.search(rest)
+        if check:
+            if current is None:
+                current = {"armed_at": None, "sentence": None, "window_s": None, "checks": [], "outcome": "unattributed"}
+                windows.append(current)
+            model = check.group("model")
+            ms = int(check.group("ms"))
+            current["checks"].append({
+                "ts": stamp,
+                "n": int(check.group("n")),
+                "trigger": check.group("trigger"),
+                "verdict": VERDICT_WORDS.get(check.group("verdict"), check.group("verdict")),
+                "model": None if model in ("none", "-") else model,
+                "ms": ms or None,
+            })
+            continue
+        if rest.startswith("WATCH_FIRED") and current is not None:
+            current["outcome"] = "sighted"
+            continue
+        if rest.startswith("WATCH_EXPIRED") and current is not None:
+            reason = rest.split(":", 1)[1].strip() if ":" in rest else "window ended"
+            current["outcome"] = f"ended: {reason}"
+    return windows
+
+
+def _windows_from_server_log(path):
+    """Fallback: rebuild windows from stdout, which carries no clocks."""
     windows = []
     current = None
     for line in _tail(path, 4000):
@@ -657,6 +720,27 @@ def handle_checks(args, **_kw):
         m = ENDED_RE.search(line)
         if m and current is not None:
             current["outcome"] = f"ended: {m.group('reason').strip()}"
+    return windows
+
+
+def handle_checks(args, **_kw):
+    """Verifier behaviour, grouped by the watch window each check belongs to.
+
+    Grouping matters: a single flat list mixes every session in the log, so a
+    review has to count backwards by hand to find which checks belong to the
+    watch under discussion. A window starts at WATCH_ARMED and is closed by a
+    sighting or by the disarm line.
+    """
+    cfg = config()
+    path = _relay_dir(cfg) / "server.log"
+    if not path.exists():
+        return json.dumps({"ok": False, "action": "checks", "error": _no_relay(path, "server log")})
+    since = _parse_ts(args.get("since")) if args.get("since") else None
+    # The timestamped transcript wins when it actually carries checks; otherwise
+    # fall back to stdout, which can group the same session's checks but not date
+    # them. A relay older than the WATCH_CHECK line writes only the latter.
+    transcript_windows = _checks_from_transcript(cfg)
+    windows = transcript_windows if any(w["checks"] for w in transcript_windows) else _windows_from_server_log(path)
 
     # Date each window from the matching transcript stamp, never by position.
     armed = _transcript_watch_stamps(cfg)

@@ -130,7 +130,10 @@ Relay-side tuning lives in the environment, not the source:
 | `WATCH_WINDOW_SECONDS` | `90` | Watch window |
 | `WATCH_HEARTBEAT_MS` | `5000` | Re-check interval; `0` disables heartbeat checks |
 | `WATCH_MAX_CHECKS` | `18` | Verifier calls per window (the spend cap) |
-| `WATCH_VERIFIER_MODELS` | `gemini-3-flash-preview` | Comma-separated verifier models |
+| `WATCH_VERIFIER_MODELS` | `gemini-3-flash-preview` | Comma-separated REST fallback models |
+| `WATCH_VERIFIER_MODE` | `auto` | `live` (short Live session), `generate` (one REST call), `auto` (live, REST on failure) |
+| `WATCH_VERIFIER_TIMEOUT_MS` | `8000` | Ceiling for one verdict |
+| `LIVE_MODEL` | `models/gemini-3.8-live` | The Live model, used for the conversation and for verification |
 
 ## What goes over the network
 
@@ -159,9 +162,14 @@ sessions for anyone who finds it.
 ## Tests
 
 ```bash
-python3 plugin/tests/test_handlers.py   # 21 tests, stdlib only
+python3 plugin/tests/test_handlers.py   # 25 tests, stdlib only
+node tests/test_verifier.js             # 11 checks against the live API (needs a key)
 hermes plugins validate plugin          # manifest, capabilities, security scan
 ```
+
+`test_verifier.js` is not a mock: it opens real Live sessions and asserts the verdicts —
+blue frame for "the screen turns blue" must answer YES, a red frame must answer NO, and
+a one-millisecond timeout must return null rather than hang the watch loop.
 
 Fixtures are real relay log lines, not synthesised ones, so a parser that stops
 matching fails a test instead of returning an empty answer.

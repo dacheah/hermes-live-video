@@ -25,6 +25,11 @@ One tool, `live_video`, six actions:
 
 Nothing here joins the relay's audio path or reconfigures it.
 
+`start` and `url` report `bind` and `token_required` alongside the URLs. On the
+default loopback bind there is no token to carry; on a LAN bind the URLs already
+include it, because the relay refuses `/`, the static files and the `/ws` upgrade
+without it and checks `Origin` against the host it was addressed as.
+
 ## Watch mode and how a check is answered
 
 A watch asks one question — is the thing you named in frame now? — and answers it by
@@ -72,7 +77,7 @@ Optional entries under `plugins.entries.live-video` in `config.yaml`:
 |---|---|
 | `relay_dir` | `~/hermes-live-video` (expanded per user; `$VARS` also expanded) |
 | `port` | `8098` |
-| `bind` | `0.0.0.0` (set `127.0.0.1` to keep a started relay loopback-only) |
+| `bind` | `127.0.0.1` (loopback; a LAN bind mints a per-start token and returns it in the URL) |
 | `node_bin` | `""` — `node` on PATH, then Hermes' bundled node |
 | `unit` | `hermes-live-video` (systemd **user** unit) |
 | `default_lines` | `40` |

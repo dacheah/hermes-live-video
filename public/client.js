@@ -253,7 +253,11 @@
       } catch (_) {}
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(`${proto}//${location.host}/ws`);
+      // A LAN bind is gated by a per-start token carried on the page URL; the
+      // socket has to present the same one. Loopback installs see no token.
+      const token = new URLSearchParams(location.search).get('token');
+      const qs = token ? `?token=${encodeURIComponent(token)}` : '';
+      ws = new WebSocket(`${proto}//${location.host}/ws${qs}`);
 
       ws.onopen = () => {
         updateState('listening');

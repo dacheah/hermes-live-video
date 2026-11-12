@@ -60,31 +60,51 @@ stops asking.
 
 ## Install
 
-```bash
-git clone https://github.com/dacheah/hermes-live-video
-cd hermes-live-video
-npm install
-python3 -m pip install numpy pillow torch
-```
-
-Copy the plugin into your Hermes plugin directory and enable it:
+The plugin directory *is* the relay: `plugin.yaml`, `server.js`, `public/` and the
+vision tracker ship in one tree, so what Hermes loads is the code the catalogue
+pinned. Nothing is copied out of the repository.
 
 ```bash
-cp -r plugin ~/.hermes/plugins/live-video
-hermes plugins enable live-video
+# from the catalogue, or straight from the pinned commit
+hermes plugins install live-video
+hermes plugins install dacheah/hermes-live-video
 hermes secrets set GEMINI_API_KEY                  # the plugin passes it to the relay
+
+# the relay's own dependencies, in the plugin directory
+cd ~/.hermes/plugins/live-video && npm ci
+python3 -m pip install numpy pillow torch
 ```
 
 Then, in a Hermes session:
 
 > **You:** start live video
 >
-> **Hermes:** *(live_video → start)* Relay is up on port 8098 — open
-> `http://192.168.1.24:8098/` on your phone and press Start.
+> **Hermes:** *(live_video → start)* Relay is up on `http://127.0.0.1:8098/`.
 
-Open the URL on a phone on the same network, allow the microphone and camera, and
-press **Start**. Use HTTPS (a tunnel in front of the relay) if you want to reach it
-away from home; browsers only grant camera access on secure origins.
+## Reaching it from a phone
+
+The relay binds to `127.0.0.1` by default: nothing on the network can open it, and
+nothing needs a token. That is the right default, and it is the only mode a
+catalogue install uses unless the user changes it.
+
+A phone is not on the loopback interface, so reaching the relay from one means
+either a tunnel in front of it (keep the loopback bind — recommended, and camera
+access requires a secure origin anyway) or an explicit LAN bind:
+
+```yaml
+plugins:
+  entries:
+    live-video:
+      bind: 0.0.0.0
+```
+
+On a non-loopback bind the plugin mints a random token per start, writes it to
+`<HERMES_HOME>/plugin-data/live-video/relay.token` with mode `0600`, passes it to
+the relay as `LIVE_TOKEN`, and returns URLs that already carry it —
+`http://192.168.1.24:8098/?token=…`. The relay refuses `/`, the static files and
+the `/ws` upgrade without that token, and refuses any request whose `Origin` is
+not the host it was addressed as. `/healthz` stays open so a supervisor can probe
+it; it reports no key material. Stopping the relay deletes the token.
 
 ## The tool
 
@@ -106,15 +126,16 @@ attach to it.
 
 ## Configuration
 
-Everything is optional; the defaults assume `~/hermes-live-video` and port 8098.
+Everything is optional. The defaults are this plugin's own directory — the relay
+ships in the same reviewed tree as the manifest — port 8098, and a loopback bind.
 
 ```yaml
 plugins:
   entries:
     live-video:
-      relay_dir: ~/hermes-live-video   # where server.js lives
+      relay_dir: ""                    # empty = this plugin's own directory
       port: 8098
-      bind: 0.0.0.0                    # 127.0.0.1 behind your own tunnel
+      bind: 127.0.0.1                  # loopback; see "Reaching it from a phone"
       node_bin: ""                     # default: node on PATH, else Hermes' bundled node
       unit: hermes-live-video          # systemd user unit, if you run it as one
       window_s: 90                     # watch window length used when reading logs
@@ -162,9 +183,9 @@ sessions for anyone who finds it.
 ## Tests
 
 ```bash
-python3 plugin/tests/test_handlers.py   # 25 tests, stdlib only
+python3 tests/test_handlers.py          # 30 tests, stdlib only
 node tests/test_verifier.js             # 11 checks against the live API (needs a key)
-hermes plugins validate plugin          # manifest, capabilities, security scan
+hermes plugins validate .               # manifest, capabilities, security scan
 ```
 
 `test_verifier.js` is not a mock: it opens real Live sessions and asserts the verdicts —

@@ -27,6 +27,7 @@ import datetime as dt
 import json
 import os
 import re
+import secrets
 import shutil
 import signal
 import socket
@@ -34,19 +35,25 @@ import statistics
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 TOOLSET = "live-video"
 
+# The plugin directory *is* the relay: plugin.yaml, server.js and public/ ship
+# together in one reviewed tree, so a catalogue install runs the code the
+# catalogue pinned rather than reaching for a checkout that may not exist.
+PLUGIN_DIR = Path(__file__).resolve().parent
+
 DEFAULT_CONFIG = {
-    # Neutral default: a generic checkout location, not one machine's home.
-    # On this box ~/hermes-live-video is where the relay lives, so the default
-    # works here and gives anyone else a path that means something on their own
-    # machine. Override with plugins.entries.live-video.relay_dir.
-    "relay_dir": "~/hermes-live-video",
+    # Empty means "this plugin's own directory". Set relay_dir only to run the
+    # plugin's tool surface against a separate checkout.
+    "relay_dir": "",
     "port": 8098,
-    "bind": "0.0.0.0",
+    # Loopback by default. A LAN bind is opt-in and is gated by a per-start
+    # token, because anything routable to the port can otherwise open the page.
+    "bind": "127.0.0.1",
     "unit": "hermes-live-video",
     "node_bin": "",
     "default_lines": 40,
@@ -124,14 +131,26 @@ SCHEMA = {
 
 # --- configuration ----------------------------------------------------------
 
-def _load_config_file():
-    """Read plugins.entries.live-video from the live config.yaml, tolerantly."""
-    home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-    path = Path(home) / "config.yaml"
+def hermes_home():
+    """Hermes' own notion of its home, so paths agree with the running agent."""
     try:
-        import yaml  # present inside Hermes; optional for a bare interpreter
-        with open(path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+        from hermes_constants import get_hermes_home  # public constant
+        return Path(get_hermes_home())
+    except Exception:
+        return Path(os.environ.get("HERMES_HOME") or (Path.home() / ".hermes"))
+
+
+def _load_config_file():
+    """Read plugins.entries.live-video through Hermes' own config loader.
+
+    Reading config.yaml directly meant a second YAML parser and a second idea of
+    where the home is; the loader is the same view the agent itself sees, so a
+    profile-relative config resolves the way the user expects. A bare interpreter
+    (importable failure) falls back to the same default entry.
+    """
+    try:
+        from hermes_cli.config import load_config
+        data = load_config() or {}
         entry = ((data.get("plugins") or {}).get("entries") or {}).get("live-video") or {}
         return entry if isinstance(entry, dict) else {}
     except Exception:
@@ -150,7 +169,10 @@ def config():
 
 
 def _relay_dir(cfg):
-    return Path(os.path.expanduser(os.path.expandvars(str(cfg["relay_dir"]))))
+    value = str(cfg.get("relay_dir") or "").strip()
+    if not value:
+        return PLUGIN_DIR
+    return Path(os.path.expanduser(os.path.expandvars(value)))
 
 
 def _no_relay(path, what):
@@ -166,7 +188,7 @@ def _no_relay(path, what):
 def _state_dir():
     d = Path(
         os.environ.get("LIVE_VIDEO_STATE_DIR")
-        or (Path.home() / ".local" / "state" / "hermes-live-video")
+        or (hermes_home() / "plugin-data" / "live-video")
     )
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -206,12 +228,47 @@ def _lan_ip():
         return "127.0.0.1"
 
 
-def _urls(port):
-    lan = _lan_ip()
-    return {
-        "local": f"http://127.0.0.1:{port}/",
-        "lan": f"http://{lan}:{port}/",
+LOOPBACK_BINDS = ("127.0.0.1", "::1", "localhost")
+
+# Only what the relay needs. Inheriting the whole agent environment would hand
+# every other provider key and hermetic test variable to a child process that
+# only needs to talk to Gemini and start a tracker.
+ENV_ALLOW_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "PYTHON_BIN", "NODE_ENV"}
+ENV_ALLOW_PREFIXES = ("LIVE_", "WATCH_")
+
+
+def _token_file():
+    return _state_dir() / "relay.token"
+
+
+def _current_token():
+    try:
+        return _token_file().read_text().strip()
+    except Exception:
+        return ""
+
+
+def _urls(port, token="", bind="127.0.0.1"):
+    query = f"?token={urllib.parse.quote(token)}" if token else ""
+    urls = {"local": f"http://127.0.0.1:{port}/{query}"}
+    urls["lan"] = None if bind in LOOPBACK_BINDS else f"http://{_lan_ip()}:{port}/{query}"
+    return urls
+
+
+def _child_env(key, port, bind, token, relay):
+    env = {
+        k: v for k, v in os.environ.items()
+        if k in ENV_ALLOW_KEYS or k.startswith(ENV_ALLOW_PREFIXES)
     }
+    env.update({
+        "GEMINI_API_KEY": key,
+        "PORT": str(port),
+        "HOST": bind,
+        "LIVE_RELAY_DIR": str(relay),
+    })
+    if token:
+        env["LIVE_TOKEN"] = token
+    return env
 
 
 def _node_bin(cfg):
@@ -257,12 +314,16 @@ def _log_tail(path, lines=12):
 def handle_url(args, **_kw):
     cfg = config()
     port = cfg["port"]
+    bind = str(cfg.get("bind") or "127.0.0.1")
+    token = "" if bind in LOOPBACK_BINDS else _current_token()
     health = _probe(port)
     return json.dumps({
         "ok": health is not None,
         "action": "url",
         "port": port,
-        "urls": _urls(port),
+        "bind": bind,
+        "token_required": bool(token),
+        "urls": _urls(port, token, bind),
         "health": health,
     }, ensure_ascii=False)
 
@@ -270,7 +331,11 @@ def handle_url(args, **_kw):
 def handle_start(args, **_kw):
     cfg = config()
     port = cfg["port"]
-    urls = _urls(port)
+    bind = str(cfg.get("bind") or "127.0.0.1")
+    # A non-loopback bind is everyone on the network, so it carries a token that
+    # exists only for this run and is handed back in the URL.
+    token = "" if bind in LOOPBACK_BINDS else secrets.token_urlsafe(24)
+    urls = _urls(port, token, bind)
 
     health = _probe(port)
     if health:
@@ -301,14 +366,13 @@ def handle_start(args, **_kw):
         })
 
     log = _log_file()
-    env = dict(os.environ)
-    env.update({
-        "GEMINI_API_KEY": key,
-        "PORT": str(port),
-        # 0.0.0.0 so a phone on the same network can reach it; set bind to
-        # 127.0.0.1 to keep it loopback-only behind your own tunnel.
-        "HOST": str(cfg.get("bind") or "0.0.0.0"),
-    })
+    env = _child_env(key, port, bind, token, relay)
+    if token:
+        _token_file().write_text(token)
+        try:
+            _token_file().chmod(0o600)
+        except Exception:
+            pass
     try:
         with open(log, "ab") as fh:
             proc = subprocess.Popen(
@@ -333,6 +397,7 @@ def handle_start(args, **_kw):
         if health:
             return json.dumps({
                 "ok": True, "action": "start", "pid": proc.pid, "port": port,
+                "bind": bind, "token_required": bool(token),
                 "urls": urls, "health": health, "log": str(log),
             }, ensure_ascii=False)
         if proc.poll() is not None:
@@ -372,6 +437,7 @@ def handle_stop(args, **_kw):
 
     if not _pid_alive(pid):
         pid_path.unlink(missing_ok=True)
+        _token_file().unlink(missing_ok=True)
         return json.dumps({"ok": True, "action": "stop", "stopped": False, "note": f"pid {pid} was already gone"})
 
     try:
@@ -383,6 +449,7 @@ def handle_stop(args, **_kw):
         time.sleep(0.5)
         if not _pid_alive(pid):
             pid_path.unlink(missing_ok=True)
+            _token_file().unlink(missing_ok=True)
             return json.dumps({"ok": True, "action": "stop", "stopped": True, "pid": pid})
     return json.dumps({
         "ok": False, "action": "stop",

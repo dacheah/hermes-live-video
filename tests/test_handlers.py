@@ -1,6 +1,7 @@
 """Handler tests for the live-video plugin.
 
-Stdlib only: run with `python3 tests/test_handlers.py` from the plugin directory.
+Stdlib only: run with `python3 tests/test_handlers.py` from the repo root, which
+is also the plugin directory.
 Every expected value is taken from a real relay log line observed on 2026-11-12,
 not from the parser's own arithmetic, so a regex that stops matching shows up as
 a failure rather than as a quietly empty result.
@@ -244,14 +245,60 @@ class Handlers(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertIn("unknown action", out["error"])
 
-    def test_default_relay_dir_is_not_anyone_s_home(self):
-        # A shipped default must mean something on a stranger's machine.
-        self.assertEqual(tools.DEFAULT_CONFIG["relay_dir"], "~/hermes-live-video")
-        self.assertNotIn("/home/", tools.DEFAULT_CONFIG["relay_dir"])
+    def test_default_relay_dir_is_the_plugin_itself(self):
+        # The catalogue installs the plugin tree; the relay is that tree, so the
+        # default must resolve to this directory rather than to a stranger's home.
+        self.assertEqual(tools.DEFAULT_CONFIG["relay_dir"], "")
+        self.assertEqual(tools._relay_dir({"relay_dir": ""}), tools.PLUGIN_DIR)
+        self.assertTrue((tools.PLUGIN_DIR / "server.js").exists())
         self.assertEqual(
-            tools._relay_dir({"relay_dir": "~/hermes-live-video"}),
-            Path.home() / "hermes-live-video",
+            tools._relay_dir({"relay_dir": "~/elsewhere"}),
+            Path.home() / "elsewhere",
         )
+
+    def test_default_bind_is_loopback(self):
+        self.assertEqual(tools.DEFAULT_CONFIG["bind"], "127.0.0.1")
+
+    def test_lan_bind_mints_a_token_and_carries_it_in_the_url(self):
+        token = "tok3n-for-this-run"
+        urls = tools._urls(8098, token, "0.0.0.0")
+        self.assertTrue(urls["local"].endswith(f"?token={token}"))
+        self.assertIn(":8098/?token=", urls["lan"])
+        loopback = tools._urls(8098, "", "127.0.0.1")
+        self.assertEqual(loopback["local"], "http://127.0.0.1:8098/")
+        self.assertIsNone(loopback["lan"])
+
+    def test_child_env_is_minimal_and_carries_the_key(self):
+        os.environ["OPENAI_API_KEY"] = "should-not-leak"
+        os.environ["WATCH_WINDOW_SECONDS"] = "45"
+        os.environ["LIVE_USER_NAME"] = "Tester"
+        try:
+            env = tools._child_env("gem-key", 8098, "0.0.0.0", "tok", Path("/relay"))
+        finally:
+            for k in ("OPENAI_API_KEY", "WATCH_WINDOW_SECONDS", "LIVE_USER_NAME"):
+                os.environ.pop(k, None)
+        self.assertNotIn("OPENAI_API_KEY", env)
+        self.assertEqual(env["GEMINI_API_KEY"], "gem-key")
+        self.assertEqual(env["HOST"], "0.0.0.0")
+        self.assertEqual(env["PORT"], "8098")
+        self.assertEqual(env["LIVE_TOKEN"], "tok")
+        self.assertEqual(env["WATCH_WINDOW_SECONDS"], "45")
+        self.assertEqual(env["LIVE_USER_NAME"], "Tester")
+        self.assertIn("PATH", env)
+
+    def test_state_lives_under_hermes_home_plugin_data(self):
+        home = Path(self.tmp.name) / "hermes-home"
+        os.environ["HERMES_HOME"] = str(home)
+        os.environ.pop("LIVE_VIDEO_STATE_DIR", None)
+        try:
+            self.assertEqual(tools._state_dir(), home / "plugin-data" / "live-video")
+        finally:
+            os.environ.pop("HERMES_HOME", None)
+
+    def test_config_loader_falls_back_without_raising(self):
+        # Under a bare interpreter hermes_cli may be unimportable; the entry is
+        # then simply empty, never an exception on the agent's tool call.
+        self.assertIsInstance(tools._load_config_file(), dict)
 
     def test_missing_relay_explains_what_to_set(self):
         os.environ["LIVE_VIDEO_RELAY_DIR"] = str(Path(self.tmp.name) / "absent")

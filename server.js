@@ -5,10 +5,47 @@ const os = require('os');
 const path = require('path');
 const { spawn, spawnSync } = require('child_process');
 const { WebSocketServer, WebSocket } = require('ws');
+const crypto = require('crypto');
 const { createVerifier } = require('./lib/verifier');
 
 const PORT = Number(process.env.PORT || 8098);
 const HOST = process.env.HOST || '127.0.0.1';
+
+// --- Access control ----------------------------------------------------------
+// Loopback is the default and needs no credential. The moment the relay is
+// bound beyond it, anyone who can route to the port could open the page, run a
+// Gemini session on the user's key and have their speech written to the
+// transcript the model later reads. So a non-loopback bind requires a token,
+// and the token is minted per start and handed back in the URL.
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', '::1', 'localhost']);
+const TOKEN_REQUIRED = !LOOPBACK_HOSTS.has(HOST);
+let LIVE_TOKEN = (process.env.LIVE_TOKEN || '').trim();
+if (TOKEN_REQUIRED && !LIVE_TOKEN) {
+  LIVE_TOKEN = crypto.randomBytes(24).toString('base64url');
+  console.log('[live-video] no LIVE_TOKEN supplied for a non-loopback bind; minted one for this process');
+}
+
+function tokenMatches(req, url) {
+  if (!TOKEN_REQUIRED) return true;
+  const supplied = String(
+    url.searchParams.get('token') || req.headers['x-live-token'] || ''
+  );
+  const a = Buffer.from(supplied);
+  const b = Buffer.from(LIVE_TOKEN);
+  return a.length === b.length && a.length > 0 && crypto.timingSafeEqual(a, b);
+}
+
+// A browser sends Origin; a cross-site page would carry a foreign one. Compare
+// against the host the request was actually addressed to.
+function originMatches(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === (req.headers.host || '');
+  } catch (_) {
+    return false;
+  }
+}
 const PUBLIC_DIR = path.join(__dirname, 'public');
 
 // --- Persona -----------------------------------------------------------------
@@ -169,6 +206,15 @@ const server = http.createServer((req, res) => {
     return res.end(JSON.stringify({ ok: true, port: PORT, hasKey: Boolean(key), tracker: Boolean(PYTHON_BIN) }));
   }
 
+  if (!originMatches(req)) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('cross-origin request refused');
+  }
+  if (!tokenMatches(req, url)) {
+    res.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
+    return res.end('token required: open the URL the plugin returned');
+  }
+
   const rel = url.pathname === '/' ? '/index.html' : url.pathname;
   const file = path.join(PUBLIC_DIR, path.normalize(rel).replace(/^(\.\.[/\\])+/, ''));
   if (!file.startsWith(PUBLIC_DIR)) {
@@ -190,7 +236,7 @@ const wss = new WebSocketServer({ noServer: true });
 
 server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (url.pathname !== '/ws') {
+  if (url.pathname !== '/ws' || !originMatches(req) || !tokenMatches(req, url)) {
     socket.destroy();
     return;
   }
@@ -626,6 +672,7 @@ server.on('upgrade', (req, socket, head) => {
 
 server.listen(PORT, HOST, () => {
   console.log(`[live-video] listening on http://${HOST}:${PORT}`);
+  console.log(`[live-video] access: ${TOKEN_REQUIRED ? 'token required (non-loopback bind)' : 'loopback only, no token needed'}`);
   console.log(`[live-video] watch mode: window=${WATCH_WINDOW_SECONDS}s settle=${WATCH_SETTLE_MS}ms ` +
     `heartbeat=${WATCH_HEARTBEAT_MS > 0 ? WATCH_HEARTBEAT_MS + 'ms' : 'disabled (scene change only)'} ` +
     `max_checks=${WATCH_MAX_CHECKS} verifier=${WATCH_VERIFIER_MODE}(${VERIFIER_MODELS.join(',')}) live=${LIVE_MODEL}`);

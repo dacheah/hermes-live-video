@@ -243,8 +243,28 @@ LOOPBACK_BINDS = ("127.0.0.1", "::1", "localhost")
 # Only what the relay needs. Inheriting the whole agent environment would hand
 # every other provider key and hermetic test variable to a child process that
 # only needs to talk to Gemini and start a tracker.
-ENV_ALLOW_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "PYTHON_BIN", "NODE_ENV"}
+# Windows cannot start Node without these. %SystemRoot% is how it loads
+# bcryptprimitives.dll for the CSPRNG; without it node aborts at startup with
+# "Assertion failed: ncrypto::CSPRNG(nullptr, 0)" and exit code 134. None of these
+# grant anything the relay should not have, which is why they join the allowlist
+# rather than inviting a blanket inheritance of the agent's environment.
+WINDOWS_ENV_KEYS = {
+    "SystemRoot", "SystemDrive", "windir", "TEMP", "TMP", "USERPROFILE",
+    "APPDATA", "LOCALAPPDATA", "PATHEXT", "COMSPEC", "PROGRAMDATA",
+    "HOMEDRIVE", "HOMEPATH", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+    "OS", "ProgramFiles", "ProgramFiles(x86)", "CommonProgramFiles",
+}
+ENV_ALLOW_KEYS = {"PATH", "HOME", "LANG", "LC_ALL", "TZ", "PYTHON_BIN", "NODE_ENV"} | WINDOWS_ENV_KEYS
 ENV_ALLOW_PREFIXES = ("LIVE_", "WATCH_")
+# Windows environment names are case-insensitive, so compare on the upper form
+# as well; doing it unconditionally keeps one code path for every host.
+_ENV_ALLOW_UPPER = {k.upper() for k in ENV_ALLOW_KEYS}
+
+
+def _env_allowed(key):
+    return (key in ENV_ALLOW_KEYS
+            or key.startswith(ENV_ALLOW_PREFIXES)
+            or key.upper() in _ENV_ALLOW_UPPER)
 
 
 def _token_file():
@@ -268,7 +288,7 @@ def _urls(port, token="", bind="127.0.0.1"):
 def _child_env(key, port, bind, token, relay):
     env = {
         k: v for k, v in os.environ.items()
-        if k in ENV_ALLOW_KEYS or k.startswith(ENV_ALLOW_PREFIXES)
+        if _env_allowed(k)
     }
     env.update({
         "GEMINI_API_KEY": key,

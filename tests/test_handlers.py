@@ -457,6 +457,34 @@ class WindowsProcessShape(unittest.TestCase):
         finally:
             proc.wait()
 
+    def test_windows_child_env_keeps_system_root_but_not_secrets(self):
+        """Node aborts at startup without SystemRoot; the allowlist must not widen to secrets."""
+        saved = {}
+        for k, v in (("SystemRoot", "C:/Windows"), ("AWS_SECRET_ACCESS_KEY", "decoy")):
+            saved[k] = os.environ.get(k)
+            os.environ[k] = v
+        try:
+            env = tools._child_env("k", 8098, "127.0.0.1", "", Path("."))
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.assertEqual(env.get("SystemRoot"), "C:/Windows")
+        self.assertNotIn("AWS_SECRET_ACCESS_KEY", env)
+        self.assertEqual(env.get("GEMINI_API_KEY"), "k")
+        self.assertEqual(env.get("PORT"), "8098")
+
+    def test_env_allowlist_is_case_insensitive_for_windows_names(self):
+        self.assertTrue(tools._env_allowed("SYSTEMROOT"))
+        self.assertTrue(tools._env_allowed("systemroot"))
+        self.assertTrue(tools._env_allowed("LOCALAPPDATA"))
+        self.assertFalse(tools._env_allowed("OPENSSL_CONF"))
+        self.assertFalse(tools._env_allowed("AWS_SECRET_ACCESS_KEY"))
+        self.assertTrue(tools._env_allowed("LIVE_TOKEN"))
+        self.assertTrue(tools._env_allowed("WATCH_MAX_CHECKS"))
+
     def test_node_candidates_cover_windows_install_locations(self):
         cands = tools._node_candidates({"node_bin": "C:/Program Files/nodejs/node.exe"})
         self.assertEqual(cands[0], "C:/Program Files/nodejs/node.exe")

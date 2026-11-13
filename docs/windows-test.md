@@ -143,3 +143,29 @@ torch 2.12.1+cpu: eight checks passing — start, `/healthz` answering
 available, stop, pid gone, port free, no tracker orphaned. Two earlier attempts at
 the same run found the `SystemRoot` defect and the self-matching scan; both are
 fixed and covered by tests.
+
+### Session run (1.3.4, same host)
+
+Step 6 was then run with Chromium's synthetic devices, because the machine is a
+mini PC with no microphone. The relay console and `transcript.log` recorded:
+
+```
+[live-video] client connected, opening upstream to Gemini Live...
+[live-video] upstream connected to Gemini Live API, sending setup frame...
+[live-video] Gemini setupComplete confirmed! Draining queued frames/audio...
+[vision-tracker] Fixed-seed random-projection sketch initialised (anchor-frame drift model).
+[live-video] client health: packets=100 ctx=running rate=16000 track=live vis=visible pctx=running pqueue=0
+```
+
+That establishes the parts a self-test cannot: the upstream Live handshake, the
+WebSocket relay moving both audio packets and JPEG frames, the tracker child
+accepting frames under the relay's own spawn with torch on Windows, and a
+`taskkill` teardown that left no tracker behind (the process scan after two
+sessions returned nothing).
+
+It does **not** establish a spoken exchange. The transcript carried `AUDIO_START`
+and `CLIENT_HEALTH` but no `USER:` or `JARVIS:` turn, which is the correct result
+for a synthetic microphone: a fake device emits a tone, not speech, so the voice
+activity detector has nothing to answer. A real conversation on Windows still
+requires a camera and microphone — a phone on the same LAN against
+`HOST=0.0.0.0` with the token in the URL, or a machine with recording hardware.

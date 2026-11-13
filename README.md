@@ -53,6 +53,10 @@ which is the point of the plugin system.
 | Frame tracker | Python 3 with `numpy`, `Pillow`, `torch` (CPU is fine; no model download) |
 | Model | A Gemini API key with access to `gemini-3.8-live`; watch mode verifies with `gemini-3-flash-preview` |
 
+Linux, macOS and Windows are supported. On Windows the relay is spawned into its own
+process group and stopped with `taskkill /T`, so the frame tracker is not orphaned; if
+`node` or Python is not on `PATH`, set `node_bin` and `PYTHON_BIN` explicitly.
+
 On the free tier, `gemini-3-flash` allows **20 generate-content requests per day per
 project**, which one 90-second watch can exhaust. Watch mode realistically wants a
 billing-enabled key; without it, the relay spends its budget, says so in the log, and
@@ -74,6 +78,20 @@ hermes secrets set GEMINI_API_KEY                  # the plugin passes it to the
 cd ~/.hermes/plugins/live-video && npm ci
 python3 -m pip install numpy pillow torch
 ```
+
+On Windows, in PowerShell, the same three steps are:
+
+```powershell
+hermes plugins install live-video
+hermes secrets set GEMINI_API_KEY
+cd "$env:USERPROFILE\.hermes\plugins\live-video"
+npm ci
+py -m pip install numpy pillow torch
+```
+
+`npm ci` and `pip` are only needed once per install; the relay reads `ws` from its own
+`node_modules`, and the tracker picks the interpreter that can import `numpy`, `PIL`
+and `torch`.
 
 Then, in a Hermes session:
 
@@ -179,11 +197,16 @@ sessions for anyone who finds it.
   seconds after it appears, not instantly.
 - One watch window at a time, 90 seconds by default, with a per-window check cap.
 - The tracker needs PyTorch. It downloads no weights, but the dependency is large.
+- **Windows support is implemented and unit-tested but has not yet been exercised on a
+  real Windows host** — the spawn, liveness and termination paths are covered by tests
+  that run the Windows branch on any machine, and `npm ci`/`pip` are the same commands,
+  but the first end-to-end run there is still owed. If it misbehaves, the log tail from
+  `start` says where.
 
 ## Tests
 
 ```bash
-python3 tests/test_handlers.py          # 30 tests, stdlib only
+python3 tests/test_handlers.py          # 37 tests, stdlib only
 node tests/test_verifier.js             # 11 checks against the live API (needs a key)
 hermes plugins validate .               # manifest, capabilities, security scan
 ```

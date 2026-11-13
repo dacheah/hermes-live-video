@@ -85,11 +85,16 @@ const SYSTEM_PROMPT = getSystemPrompt();
 // vision_tracker.py needs numpy, Pillow and torch. Resolve an interpreter that
 // has them rather than assuming one machine's virtualenv path.
 function resolvePython() {
+  // A Windows install puts the interpreter in .venv\Scripts and names it
+  // python.exe; the POSIX paths stay first so nothing changes on those hosts.
   const candidates = [
     process.env.PYTHON_BIN,
     path.join(__dirname, '.venv', 'bin', 'python3'),
+    path.join(__dirname, '.venv', 'Scripts', 'python.exe'),
     'python3',
-    '/usr/bin/python3'
+    '/usr/bin/python3',
+    'python',
+    'py'
   ].filter(Boolean);
   for (const bin of candidates) {
     try {

@@ -41,6 +41,15 @@ from pathlib import Path
 
 TOOLSET = "live-video"
 
+# Windows needs a different spawn and kill shape, not merely different paths:
+# `start_new_session` and the POSIX signals do not exist there, `os.kill(pid, 0)`
+# is not a liveness probe (on Windows it *terminates* the process), and killing
+# node alone would leave the Python tracker orphaned. Kept as module-level flags
+# so a test can exercise both branches on any host.
+IS_WINDOWS = os.name == "nt"
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+
 # The plugin directory *is* the relay: plugin.yaml, server.js and public/ ship
 # together in one reviewed tree, so a catalogue install runs the code the
 # catalogue pinned rather than reaching for a checkout that may not exist.
@@ -271,14 +280,23 @@ def _child_env(key, port, bind, token, relay):
     return env
 
 
-def _node_bin(cfg):
+def _node_candidates(cfg):
+    home = Path.home()
     candidates = [
         cfg.get("node_bin") or "",
         os.environ.get("NODE_BIN") or "",
         shutil.which("node") or "",
-        str(Path.home() / ".hermes" / "node" / "bin" / "node"),
+        shutil.which("node.exe") or "",
+        str(home / ".hermes" / "node" / "bin" / "node"),
+        str(home / ".hermes" / "node" / "node.exe"),
+        os.path.expandvars(r"%ProgramFiles%\nodejs\node.exe"),
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\nodejs\node.exe"),
     ]
-    for c in candidates:
+    return candidates
+
+
+def _node_bin(cfg):
+    for c in _node_candidates(cfg):
         if c and Path(c).exists():
             return c
     return None
@@ -296,12 +314,62 @@ def _api_key():
         return None, f"secret scope unavailable ({exc.__class__.__name__})"
 
 
-def _pid_alive(pid):
+def _win_pid_alive(pid):
+    """Liveness on Windows, where os.kill(pid, 0) would terminate the process."""
+    import ctypes
+    from ctypes import wintypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not handle:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _pid_alive(pid, windows=None):
+    if (IS_WINDOWS if windows is None else windows):
+        try:
+            return _win_pid_alive(pid)
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True
     except Exception:
         return False
+
+
+def _spawn_kwargs(windows=None):
+    """Detach the relay so it outlives the tool call, by the platform's own means."""
+    if IS_WINDOWS if windows is None else windows:
+        return {"creationflags": CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS}
+    return {"start_new_session": True}
+
+
+def _terminate(pid, windows=None):
+    """Stop the relay and whatever it spawned.
+
+    On POSIX SIGTERM is enough because the relay's children die with it; on
+    Windows a bare termination leaves the Python tracker running, so the tree
+    is killed explicitly.
+    """
+    win = IS_WINDOWS if windows is None else windows
+    if win:
+        subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            check=False, timeout=30,
+        )
+        return
+    os.kill(pid, signal.SIGTERM)
 
 
 def _log_tail(path, lines=12):
@@ -382,7 +450,7 @@ def handle_start(args, **_kw):
                 stdout=fh,
                 stderr=fh,
                 stdin=subprocess.DEVNULL,
-                start_new_session=True,
+                **_spawn_kwargs(),
             )
     except Exception as exc:
         return json.dumps({"ok": False, "action": "start", "error": f"could not spawn the relay: {exc}"})
@@ -441,9 +509,9 @@ def handle_stop(args, **_kw):
         return json.dumps({"ok": True, "action": "stop", "stopped": False, "note": f"pid {pid} was already gone"})
 
     try:
-        os.kill(pid, signal.SIGTERM)
+        _terminate(pid)
     except Exception as exc:
-        return json.dumps({"ok": False, "action": "stop", "error": f"could not signal pid {pid}: {exc}"})
+        return json.dumps({"ok": False, "action": "stop", "error": f"could not stop pid {pid}: {exc}"})
 
     for _ in range(20):
         time.sleep(0.5)
@@ -453,7 +521,7 @@ def handle_stop(args, **_kw):
             return json.dumps({"ok": True, "action": "stop", "stopped": True, "pid": pid})
     return json.dumps({
         "ok": False, "action": "stop",
-        "error": f"pid {pid} still alive 10s after SIGTERM",
+        "error": f"pid {pid} still alive 10s after the stop signal",
     })
 
 

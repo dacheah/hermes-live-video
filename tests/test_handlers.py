@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -379,6 +380,72 @@ class Handlers(unittest.TestCase):
         self.assertTrue(out["ok"])
         self.assertTrue(out["already_running"])
         self.assertTrue(out["health"]["tracker"])
+
+class WindowsProcessShape(unittest.TestCase):
+    """The Windows branch is exercised on Linux by passing the platform explicitly.
+
+    These cover the three places where Windows is not merely a different path:
+    detachment, liveness and termination.
+    """
+
+    def test_spawn_detaches_with_process_group_on_windows(self):
+        kwargs = tools._spawn_kwargs(windows=True)
+        self.assertNotIn("start_new_session", kwargs)
+        self.assertEqual(kwargs["creationflags"],
+                         tools.CREATE_NEW_PROCESS_GROUP | tools.DETACHED_PROCESS)
+
+    def test_spawn_uses_setsid_elsewhere(self):
+        self.assertEqual(tools._spawn_kwargs(windows=False), {"start_new_session": True})
+
+    def test_windows_liveness_never_calls_os_kill(self):
+        calls = []
+        real_kill = os.kill
+        os.kill = lambda *a, **k: self.fail("os.kill must not be used as a liveness probe on Windows")
+        try:
+            real_win = tools._win_pid_alive
+            tools._win_pid_alive = lambda pid: calls.append(pid) or True
+            try:
+                self.assertTrue(tools._pid_alive(4321, windows=True))
+            finally:
+                tools._win_pid_alive = real_win
+        finally:
+            os.kill = real_kill
+        self.assertEqual(calls, [4321])
+
+    def test_posix_liveness_uses_signal_zero(self):
+        seen = []
+        real_kill = os.kill
+        os.kill = lambda pid, sig: seen.append((pid, sig))
+        try:
+            self.assertTrue(tools._pid_alive(99, windows=False))
+        finally:
+            os.kill = real_kill
+        self.assertEqual(seen, [(99, 0)])
+
+    def test_windows_terminate_kills_the_tree(self):
+        seen = []
+        real_run = tools.subprocess.run
+        tools.subprocess.run = lambda argv, **kw: seen.append(argv)
+        try:
+            tools._terminate(1234, windows=True)
+        finally:
+            tools.subprocess.run = real_run
+        self.assertEqual(seen, [["taskkill", "/PID", "1234", "/T", "/F"]])
+
+    def test_posix_terminate_sends_sigterm(self):
+        seen = []
+        real_kill = os.kill
+        os.kill = lambda pid, sig: seen.append((pid, sig))
+        try:
+            tools._terminate(1234, windows=False)
+        finally:
+            os.kill = real_kill
+        self.assertEqual(seen, [(1234, tools.signal.SIGTERM)])
+
+    def test_node_candidates_cover_windows_install_locations(self):
+        cands = tools._node_candidates({"node_bin": "C:/Program Files/nodejs/node.exe"})
+        self.assertEqual(cands[0], "C:/Program Files/nodejs/node.exe")
+        self.assertTrue(any(c.lower().endswith("node.exe") for c in cands if c))
 
 
 if __name__ == "__main__":

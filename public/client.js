@@ -11,6 +11,14 @@
   let facingMode = 'environment';
   let nextPlayTime = 0;
   let activeSources = [];
+  // Model audio that arrives while the playback context is suspended. Mobile
+  // Chrome suspends a context when the tab is backgrounded — the camera
+  // permission prompt is enough — and refuses resume() outside a user gesture,
+  // so scheduling on a frozen clock played nothing: the reply was silent while
+  // its subtitles arrived normally. Chunks wait here until the context runs.
+  let pendingPlayback = [];
+  let audioGateHint = false;
+  const audioDiag = { queued: 0, played: 0, flushed: 0 };
 
   const startBtn = document.getElementById('start-btn');
   const toggleCamBtn = document.getElementById('toggle-cam');
@@ -110,8 +118,14 @@
         try { micAudioCtx = new AudioContextClass({ sampleRate: 16000 }); }
         catch (_) { micAudioCtx = new AudioContextClass(); }
       }
-      if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+      if (audioCtx.state === 'suspended') audioCtx.resume().then(flushPendingPlayback).catch(() => {});
       if (micAudioCtx.state === 'suspended') micAudioCtx.resume().catch(() => {});
+      if (!audioCtx.onstatechange) {
+        // Renewed by any gesture or by the OS: flush whatever arrived meanwhile.
+        audioCtx.onstatechange = () => {
+          if (audioCtx.state === 'running') flushPendingPlayback();
+        };
+      }
     } catch (err) {
       console.error('Audio unlock failed:', err);
     }
@@ -164,7 +178,9 @@
       ctx: micAudioCtx ? micAudioCtx.state : 'none',
       rate: micAudioCtx ? micAudioCtx.sampleRate : 0,
       track: track ? track.readyState + (track.muted ? '/muted' : '') : 'none',
-      vis: document.visibilityState
+      vis: document.visibilityState,
+      pctx: audioCtx ? audioCtx.state : 'none',
+      pqueue: pendingPlayback.length
     };
   }
 
@@ -177,6 +193,12 @@
       // before reporting, then report what actually happened.
       if (micAudioCtx && micAudioCtx.state === 'suspended') {
         micAudioCtx.resume().catch(() => {});
+      }
+      // The playback context needs the same revival: it is the one that goes
+      // quiet when the phone backgrounds the tab, and the mic worklet keeps
+      // running regardless, so only this line would notice.
+      if (audioCtx && audioCtx.state === 'suspended') {
+        audioCtx.resume().then(flushPendingPlayback).catch(() => {});
       }
       const h = micHealth();
       try { ws.send(JSON.stringify({ type: 'client_health', ...h })); } catch (_) {}
@@ -316,6 +338,8 @@
           // Cancel buffered audio immediately on barge-in
           activeSources.forEach(src => { try { src.stop(); } catch (_) {} });
           activeSources = [];
+          // A barge-in cancels what was said, queued or not.
+          pendingPlayback = [];
           nextPlayTime = audioCtx ? audioCtx.currentTime : 0;
           if (subtitlesEl) subtitlesEl.style.display = 'none';
           updateState('listening', false);
@@ -351,23 +375,39 @@
     }
   }
 
-  function playPcm24k(base64Data) {
-    if (!audioCtx) return;
-    if (audioCtx.state === 'suspended') {
-      audioCtx.resume();
-    }
+  // Diagnostics for automated checks (`?debug`): lets a headless browser
+  // suspend the playback context, push a chunk, and prove the chunk was queued
+  // rather than dropped. Never active in normal use.
+  if (new URLSearchParams(location.search).has('debug')) {
+    window.__liveAudio = {
+      diag: audioDiag,
+      unlock: unlockAudioContexts,
+      play: playPcm24k,
+      suspend: () => audioCtx && audioCtx.suspend(),
+      resume: () => audioCtx && audioCtx.resume(),
+      state: () => (audioCtx ? audioCtx.state : 'none'),
+      ctx: () => audioCtx,
+      pending: () => pendingPlayback.length,
+    };
+  }
+
+  function decodePcm24k(base64Data) {
     const binaryStr = atob(base64Data);
     const len = binaryStr.length;
     const bytes = new Uint8Array(len);
     for (let i = 0; i < len; i++) bytes[i] = binaryStr.charCodeAt(i);
-
-    const samples = len / 2;
+    const samples = Math.floor(len / 2);
     const float32 = new Float32Array(samples);
     const dataView = new DataView(bytes.buffer);
     for (let i = 0; i < samples; i++) {
       float32[i] = dataView.getInt16(i * 2, true) / 32768.0;
     }
+    return float32;
+  }
 
+  function scheduleFloat32(float32) {
+    const samples = float32.length;
+    if (!samples) return;
     const buffer = audioCtx.createBuffer(1, samples, 24000);
     buffer.getChannelData(0).set(float32);
 
@@ -380,6 +420,7 @@
     source.start(nextPlayTime);
     nextPlayTime += buffer.duration;
 
+    audioDiag.played++;
     activeSources.push(source);
     source.onended = () => {
       const idx = activeSources.indexOf(source);
@@ -390,8 +431,54 @@
     };
   }
 
+  function flushPendingPlayback() {
+    if (!audioCtx || audioCtx.state !== 'running' || pendingPlayback.length === 0) return;
+    const queued = pendingPlayback;
+    pendingPlayback = [];
+    audioDiag.flushed += queued.length;
+    // Keep the clock honest: everything buffered while suspended is played now,
+    // in order, from the current time rather than from a frozen one.
+    nextPlayTime = Math.max(nextPlayTime, audioCtx.currentTime);
+    queued.forEach(scheduleFloat32);
+    if (audioGateHint) {
+      audioGateHint = false;
+      updateState('listening');
+    }
+  }
+
+  function showAudioHint() {
+    if (audioGateHint) return;
+    audioGateHint = true;
+    if (overlay) overlay.textContent = 'Tap the screen for sound';
+  }
+
+  function playPcm24k(base64Data) {
+    if (!audioCtx) {
+      // No context at all means the page never saw a gesture; nothing can be
+      // played, and pretending otherwise would be a silent reply.
+      showAudioHint();
+      return;
+    }
+    const float32 = decodePcm24k(base64Data);
+
+    // Audio arriving before a sleeping phone wakes its audio context is kept,
+    // not dropped: resume() may need the next touch, and the queue flushes the
+    // moment the context reports running.
+    if (audioCtx.state !== 'running') {
+      audioDiag.queued++;
+      pendingPlayback.push(float32);
+      if (pendingPlayback.length > 300) pendingPlayback.shift();
+      showAudioHint();
+      audioCtx.resume().then(flushPendingPlayback).catch(() => {});
+      return;
+    }
+    scheduleFloat32(float32);
+  }
+
   function stopSession(clearOverlay = true) {
     if (clearOverlay) userHangup = true;
+    pendingPlayback = [];
+    audioGateHint = false;
     if (healthTimer) { clearInterval(healthTimer); healthTimer = null; }
     micWarned = false;
     silentTicks = 0;

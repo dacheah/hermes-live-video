@@ -264,6 +264,10 @@ server.on('upgrade', (req, socket, head) => {
     let lastFrameAt = 0;
     let verifierBlockedUntil = 0;   // set from a 429's retry hint; no calls until then
 
+    let audioOutParts = 0;
+    let audioOutBytes = 0;
+    let audioOutStamped = false;
+
     function appendTranscript(line) {
       fs.appendFileSync(path.join(__dirname, 'transcript.log'), `[${new Date().toISOString()}] ${line}\n`);
     }
@@ -559,6 +563,18 @@ server.on('upgrade', (req, socket, head) => {
         const parts = sc.modelTurn?.parts || [];
         for (const p of parts) {
           if (p.inlineData?.data) {
+            audioOutParts++;
+            audioOutBytes += p.inlineData.data.length;
+            // One line per model turn, so "the reply was silent" can be settled
+            // from the transcript: audio sent but unheard is a client problem,
+            // no line at all is ours.
+            if (!audioOutStamped) {
+              audioOutStamped = true;
+              appendTranscript(
+                `AUDIO_OUT: first model audio parts=1 bytes=${p.inlineData.data.length} ` +
+                `mime=${p.inlineData.mimeType || 'unknown'}`
+              );
+            }
             if (clientWs.readyState === WebSocket.OPEN) {
               clientWs.send(JSON.stringify({
                 type: 'audio',
@@ -571,6 +587,7 @@ server.on('upgrade', (req, socket, head) => {
         }
 
         if (sc.turnComplete) {
+          audioOutStamped = false;
           console.log('[live-video] Gemini completed speaking turn');
           if (clientWs.readyState === WebSocket.OPEN) {
             clientWs.send(JSON.stringify({ type: 'status', state: 'listening' }));
@@ -597,7 +614,8 @@ server.on('upgrade', (req, socket, head) => {
         let chunk = null;
 
         if (parsed.type === 'client_health') {
-          const h = `packets=${parsed.packets} ctx=${parsed.ctx} rate=${parsed.rate} track=${parsed.track} vis=${parsed.vis}`;
+          const h = `packets=${parsed.packets} ctx=${parsed.ctx} rate=${parsed.rate} track=${parsed.track} vis=${parsed.vis}` +
+            (parsed.pctx ? ` pctx=${parsed.pctx} pqueue=${parsed.pqueue ?? 0}` : '');
           // Log only the first report and any change: an unchanged heartbeat
           // every 5s buries the conversation in the transcript.
           const shape = `ctx=${parsed.ctx} rate=${parsed.rate} track=${parsed.track} vis=${parsed.vis}`;

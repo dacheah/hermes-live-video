@@ -966,15 +966,22 @@ def _tracker_pids():
     """Pids of frame-tracker processes on this host, by command line."""
     try:
         if IS_WINDOWS:
-            cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
-                   "'*vision_tracker.py*' } | Select-Object -ExpandProperty ProcessId")
+            # Restrict to python executables and exclude the shell running the
+            # query: the pattern itself appears in that shell's command line, so a
+            # plain CommandLine match reports the enumerator as a tracker.
+            cmd = ("Get-CimInstance Win32_Process | Where-Object { "
+                   "$_.ProcessId -ne $PID -and $_.Name -match '^(python|py)(w)?\\.exe$' "
+                   "-and $_.CommandLine -like '*vision_tracker.py*' } | "
+                   "Select-Object -ExpandProperty ProcessId")
             out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
                                  capture_output=True, text=True, timeout=30).stdout
         else:
             out = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True,
                                  text=True, timeout=30).stdout
+            me = str(os.getpid())
             out = "\n".join(l.split()[0] for l in out.splitlines()
-                              if "vision_tracker.py" in l and "ps -eo" not in l)
+                              if "vision_tracker.py" in l and "ps -eo" not in l
+                              and l.split()[0] != me)
         return [int(x) for x in out.split() if x.strip().isdigit()]
     except Exception:
         return []

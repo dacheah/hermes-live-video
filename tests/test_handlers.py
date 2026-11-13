@@ -444,6 +444,21 @@ class WindowsProcessShape(unittest.TestCase):
             os.kill = real_kill
         self.assertEqual(seen, [(1234, tools.signal.SIGTERM)])
 
+    def test_tracker_scan_finds_a_real_tracker_and_not_itself(self):
+        """The scan runs a command containing the pattern, so it must exclude itself."""
+        here = Path(tempfile.mkdtemp())
+        script = here / "vision_tracker.py"
+        script.write_text("import time\ntime.sleep(30)\n")
+        proc = subprocess.Popen([sys.executable, str(script)])
+        try:
+            time.sleep(0.8)
+            pids = tools._tracker_pids()
+            self.assertIn(proc.pid, pids)
+            self.assertNotIn(os.getpid(), pids)
+        finally:
+            proc.kill()
+            proc.wait()
+
     def test_zombie_child_counts_as_dead(self):
         """An exited-but-unwaited child answers signal 0; it must not read as alive."""
         proc = subprocess.Popen([sys.executable, "-c", "pass"])

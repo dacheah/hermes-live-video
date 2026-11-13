@@ -206,7 +206,7 @@ sessions for anyone who finds it.
 ## Tests
 
 ```bash
-python3 tests/test_handlers.py          # 37 tests, stdlib only
+python3 tests/test_handlers.py          # 41 tests, stdlib only
 node tests/test_verifier.js             # 11 checks against the live API (needs a key)
 hermes plugins validate .               # manifest, capabilities, security scan
 ```

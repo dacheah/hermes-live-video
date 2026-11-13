@@ -134,3 +134,12 @@ to stop the relay when finished.
 - **Does not prove:** the Hermes plugin loader path on Windows. That needs a native
   Hermes install, which this test deliberately avoids. If the self-test passes and
   step 6 works, the remaining risk is confined to the loader, not to the relay.
+
+## Result on the reference host (Windows 11, 13 November 2026)
+
+Run from `C:\Users\dache\hlv` at 1.3.3 with Node 24.18.0, Python 3.14.6 and
+torch 2.12.1+cpu: eight checks passing — start, `/healthz` answering
+`{"ok":true,"port":8097,"hasKey":true,"tracker":true}`, key seen, tracker
+available, stop, pid gone, port free, no tracker orphaned. Two earlier attempts at
+the same run found the `SystemRoot` defect and the self-matching scan; both are
+fixed and covered by tests.

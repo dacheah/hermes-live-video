@@ -197,16 +197,19 @@ sessions for anyone who finds it.
   seconds after it appears, not instantly.
 - One watch window at a time, 90 seconds by default, with a per-window check cap.
 - The tracker needs PyTorch. It downloads no weights, but the dependency is large.
-- **Windows support is implemented and unit-tested but has not yet been exercised on a
-  real Windows host** — the spawn, liveness and termination paths are covered by tests
-  that run the Windows branch on any machine, and `npm ci`/`pip` are the same commands,
-  but the first end-to-end run there is still owed. If it misbehaves, the log tail from
-  `start` says where.
+- **Windows is exercised, but not through the Hermes loader.** The relay path has been
+run on Windows 11 (Node 24.18.0, Python 3.14.6, torch 2.12.1+cpu): detached spawn,
+`/healthz` with a key and the tracker available, `taskkill /T` teardown, pid gone, port
+free and no tracker orphaned — reproduced twice, and reachable here without Hermes via
+`py tools.py --selftest` (see [docs/windows-test.md](docs/windows-test.md)). What has
+*not* been exercised on Windows is the Hermes plugin loader calling those same
+functions; if that misbehaves, the log tail from `start` says where.
 
 ## Tests
 
 ```bash
 python3 tests/test_handlers.py          # 41 tests, stdlib only
+py tools.py --selftest                  # host self-test: spawn, health, stop, orphans
 node tests/test_verifier.js             # 11 checks against the live API (needs a key)
 hermes plugins validate .               # manifest, capabilities, security scan
 ```

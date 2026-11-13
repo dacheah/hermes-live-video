@@ -33,6 +33,7 @@ import signal
 import socket
 import statistics
 import subprocess
+import sys
 import time
 import urllib.error
 import urllib.parse
@@ -342,9 +343,16 @@ def _pid_alive(pid, windows=None):
             return False
     try:
         os.kill(pid, 0)
-        return True
     except Exception:
         return False
+    # A child that has exited but not been waited for is a zombie: it still
+    # answers signal 0, yet it holds nothing. Stop reporting it as alive, which
+    # would otherwise look like a failed shutdown.
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+    except Exception:
+        return True
 
 
 def _spawn_kwargs(windows=None):
@@ -928,6 +936,96 @@ def handle_live_video(args, **kwargs):
     return handler(args, **kwargs)
 
 
+# --- host self-test ---------------------------------------------------------
+# The Windows branch is unit-tested on Linux by injecting the platform, which
+# proves the shape of the calls but not the calls themselves. This runs the real
+# path on the host it is on: spawn, health, the tracker child, then stop and a
+# check that nothing was orphaned.
+
+def _tracker_pids():
+    """Pids of frame-tracker processes on this host, by command line."""
+    try:
+        if IS_WINDOWS:
+            cmd = ("Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "
+                   "'*vision_tracker.py*' } | Select-Object -ExpandProperty ProcessId")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", cmd],
+                                 capture_output=True, text=True, timeout=30).stdout
+        else:
+            out = subprocess.run(["ps", "-eo", "pid,args"], capture_output=True,
+                                 text=True, timeout=30).stdout
+            out = "\n".join(l.split()[0] for l in out.splitlines()
+                              if "vision_tracker.py" in l and "ps -eo" not in l)
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _selftest(argv=None):
+    args = list(argv or [])
+    if "--selftest" not in args:
+        print("usage: python tools.py --selftest   (or py tools.py --selftest)")
+        return 2
+    cfg = config()
+    print(f"platform      : {sys.platform} (IS_WINDOWS={IS_WINDOWS})")
+    print(f"node          : {_node_bin(cfg) or 'NOT FOUND'}")
+    print(f"relay dir     : {_relay_dir(cfg)}")
+    print(f"port          : {cfg['port']}  bind: {cfg.get('bind')}")
+
+    if not _api_key()[0] and os.environ.get("GEMINI_API_KEY"):
+        globals()["_api_key"] = lambda: (os.environ["GEMINI_API_KEY"].strip(), "environment")
+        print("key           : from GEMINI_API_KEY in this shell")
+
+    failures = []
+
+    def check(name, ok, detail=""):
+        print(f"  {'PASS' if ok else 'FAIL'}  {name}{(' — ' + detail) if detail else ''}")
+        if not ok:
+            failures.append(name)
+
+    started = json.loads(handle_start({}))
+    check("start reports ok", bool(started.get("ok")), str(started.get("error") or ""))
+    if not started.get("ok"):
+        print(json.dumps(started, indent=2)[:1200])
+        return 1
+    print(f"  url: {(started.get('urls') or {}).get('local')}")
+    pid = started.get("pid")
+    print(f"  relay pid: {pid}")
+
+    def _body(h):
+        if not isinstance(h, dict):
+            return {}
+        return h["body"] if isinstance(h.get("body"), dict) else h
+
+    health = started.get("health") or {}
+    body = _body(health)
+    check("/healthz answers", bool(body), json.dumps(health)[:200])
+    check("relay sees a key", bool(body.get("hasKey")), json.dumps(body)[:200])
+    tracker_flag = bool(body.get("tracker"))
+    print(f"  tracker available in relay: {tracker_flag} "
+          f"(False means no python with numpy+Pillow+torch — set PYTHON_BIN)")
+
+    time.sleep(2)
+    before = _tracker_pids()
+    print(f"  tracker processes while running: {before}")
+    if tracker_flag:
+        print("  (the tracker child starts with a session, not at boot — none expected yet)")
+
+    stopped = json.loads(handle_stop({}))
+    check("stop reports ok", bool(stopped.get("ok")), str(stopped.get("error") or ""))
+    check("pid no longer alive", not _pid_alive(pid) if pid else False, f"pid {pid}")
+
+    time.sleep(2)
+    after = _tracker_pids()
+    print(f"  tracker processes after stop: {after}")
+    if before:
+        check("no tracker left behind", not after, f"still running: {after}")
+    probe = _probe(cfg["port"])
+    check("port is free", probe is None, f"something still answers: {probe}")
+
+    print(f"\n{len(failures)} failed" if failures else "\nself-test passed")
+    return 1 if failures else 0
+
+
 def register_tools(ctx):
     if not hasattr(ctx, "register_tool"):
         return
@@ -938,3 +1036,7 @@ def register_tools(ctx):
         handler=handle_live_video,
         emoji="\U0001F4F9",
     )
+
+
+if __name__ == "__main__":
+    sys.exit(_selftest(sys.argv[1:]))

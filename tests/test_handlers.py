@@ -9,8 +9,10 @@ a failure rather than as a quietly empty result.
 
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -441,6 +443,19 @@ class WindowsProcessShape(unittest.TestCase):
         finally:
             os.kill = real_kill
         self.assertEqual(seen, [(1234, tools.signal.SIGTERM)])
+
+    def test_zombie_child_counts_as_dead(self):
+        """An exited-but-unwaited child answers signal 0; it must not read as alive."""
+        proc = subprocess.Popen([sys.executable, "-c", "pass"])
+        try:
+            for _ in range(40):
+                if Path(f"/proc/{proc.pid}/stat").exists():
+                    break
+                time.sleep(0.05)
+            time.sleep(0.3)
+            self.assertFalse(tools._pid_alive(proc.pid, windows=False))
+        finally:
+            proc.wait()
 
     def test_node_candidates_cover_windows_install_locations(self):
         cands = tools._node_candidates({"node_bin": "C:/Program Files/nodejs/node.exe"})

@@ -570,9 +570,13 @@ server.on('upgrade', (req, socket, head) => {
             // no line at all is ours.
             if (!audioOutStamped) {
               audioOutStamped = true;
+              // The first part of a turn is frequently a 3-byte placeholder, so
+              // record whether it carries signal at all; the turn's real volume
+              // is summed at turnComplete.
+              const n = p.inlineData.data.length;
               appendTranscript(
-                `AUDIO_OUT: first model audio parts=1 bytes=${p.inlineData.data.length} ` +
-                `mime=${p.inlineData.mimeType || 'unknown'}`
+                `AUDIO_OUT: first model audio parts=1 bytes=${n} ` +
+                `placeholder=${n < 64 ? 1 : 0} mime=${p.inlineData.mimeType || 'unknown'}`
               );
             }
             if (clientWs.readyState === WebSocket.OPEN) {
@@ -587,6 +591,11 @@ server.on('upgrade', (req, socket, head) => {
         }
 
         if (sc.turnComplete) {
+          if (audioOutParts > 0) {
+            appendTranscript(`AUDIO_OUT_SUM: parts=${audioOutParts} bytes=${audioOutBytes}`);
+          }
+          audioOutParts = 0;
+          audioOutBytes = 0;
           audioOutStamped = false;
           console.log('[live-video] Gemini completed speaking turn');
           if (clientWs.readyState === WebSocket.OPEN) {

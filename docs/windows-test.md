@@ -43,7 +43,7 @@ cd "$env:USERPROFILE\hlv"
 ```
 
 ```powershell
-git checkout e3a078cc8aeb0f024672a169eeac6a5799634973
+git checkout 66c5479d0bdb3964375801d4e49990c83908ac05
 ```
 
 ## 3. Install the relay's dependencies
@@ -166,6 +166,52 @@ sessions returned nothing).
 It does **not** establish a spoken exchange. The transcript carried `AUDIO_START`
 and `CLIENT_HEALTH` but no `USER:` or `JARVIS:` turn, which is the correct result
 for a synthetic microphone: a fake device emits a tone, not speech, so the voice
-activity detector has nothing to answer. A real conversation on Windows still
-requires a camera and microphone — a phone on the same LAN against
-`HOST=0.0.0.0` with the token in the URL, or a machine with recording hardware.
+activity detector has nothing to answer.
+
+### LAN session with a real phone (1.3.4 → 1.3.7, same host)
+
+The same relay was then bound to the LAN and driven from a phone, which is the only
+configuration that exercises the token gate (`TOKEN_REQUIRED` is false on loopback)
+and the only one with a real camera and microphone. A full spoken exchange worked —
+`USER: All right, describe what you see.` answered with a correct description of the
+keyboard, speakers and monitor — but it took four defects to get there, and each one
+is now fixed and, where a test can reach it, tested.
+
+**1. The page loaded and the start button did nothing (fixed in 1.3.5).**
+`tokenMatches()` gated every request, and a `<script src="/client.js?v=13">` cannot
+carry the `?token=` from the address bar, so the HTML was served and the JavaScript
+was refused with `403 token required`: no handler was ever attached. A valid token on
+the page request now also sets a `live_token` cookie, which the scripts, the worklet
+and the socket present. Covered by `tests/test_token_gate.js` — 8 assertions driving
+a real relay on `127.0.0.2:8096` with no browser and no key.
+
+**2. `1008 Permission denied on the service` (operator error, worth documenting).**
+Google answers `Method doesn't allow unregistered callers` for an empty key. The key
+had been set in one PowerShell window and the relay was started in another; a fresh
+window does not inherit it. `$env:GEMINI_API_KEY.Length` and `/healthz` are the two
+checks that separate "no key" from "wrong key".
+
+**3. The first spoken sentence was lost (fixed in 1.3.6).** `CLIENT_HEALTH` read
+`packets=0 ctx=suspended` at the first tick whilst the badge already said
+"Listening", then `packets=96 ctx=running` one tick later. The capture context had
+been suspended by the permission flow; because the badge was unconditional, nothing
+said so. Camera and microphone are now requested in a single `getUserMedia`, and the
+badge is bound to the real state — "Tap for mic" whenever the context is not running
+or the track is not live.
+
+**4. The picture froze mid-session (fixed in 1.3.7).** Every frame in the log arrived
+at exactly 58396 base64 characters, first to last: identical bytes mean the `<video>`
+element had stopped painting and the canvas kept redrawing its last frame, so the
+model described a desk that had stopped moving and contradicted the user about it.
+The cause was 1.3.6's own change — the element had been attached to the *combined*
+camera-and-microphone stream, and a media element carrying an audio track can be
+paused by an audio-focus change whilst its video track still reports `live`. The
+element now takes the video track alone and is muted; a paused element is revived on
+each capture tick and on any gesture; and identical frames are detected client-side,
+announced as "Camera feed frozen — tap the screen to resume", and suppressed to one
+every ten seconds so the model is not fed duplicates.
+
+What that session proves: the relay, the token gate, the Live handshake, the tracker,
+a real spoken exchange and camera description, all on Windows 11 from a phone on the
+LAN. What it does not prove: the Hermes plugin loader on Windows, and the freeze
+detection itself has no automated test — it was confirmed by the session that followed.

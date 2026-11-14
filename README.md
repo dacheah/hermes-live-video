@@ -203,12 +203,15 @@ run on Windows 11 (Node 24.18.0, Python 3.14.6, torch 2.12.1+cpu): detached spaw
 free and no tracker orphaned — reproduced twice, and reachable here without Hermes via
 `py tools.py --selftest` (see [docs/windows-test.md](docs/windows-test.md)). What has
 *not* been exercised on Windows is the Hermes plugin loader calling those same
-functions; if that misbehaves, the log tail from `start` says where.
+functions; if that misbehaves, the log tail from `start` says where. A real phone on
+the LAN against that relay has since held a full spoken exchange with the camera in
+view, which is the only configuration that exercises the access token.
 
 ## Tests
 
 ```bash
 python3 tests/test_handlers.py          # 41 tests, stdlib only
+node tests/test_token_gate.js           # 8 checks: the access token and the page's assets
 py tools.py --selftest                  # host self-test: spawn, health, stop, orphans
 node tests/test_verifier.js             # 11 checks against the live API (needs a key)
 hermes plugins validate .               # manifest, capabilities, security scan

@@ -25,10 +25,28 @@ if (TOKEN_REQUIRED && !LIVE_TOKEN) {
   console.log('[live-video] no LIVE_TOKEN supplied for a non-loopback bind; minted one for this process');
 }
 
+const TOKEN_COOKIE = 'live_token';
+
+function readCookie(req, name) {
+  const header = req.headers.cookie;
+  if (!header) return '';
+  for (const part of header.split(';')) {
+    const eq = part.indexOf('=');
+    if (eq > 0 && part.slice(0, eq).trim() === name) {
+      return decodeURIComponent(part.slice(eq + 1).trim());
+    }
+  }
+  return '';
+}
+
+// The page is opened once with ?token=…; every request after it — the script tags,
+// the worklet, the socket — cannot carry that query string. Without the cookie a
+// LAN bind serves the HTML and then refuses the JavaScript that makes the button
+// do anything, so a valid token is remembered for the rest of the session.
 function tokenMatches(req, url) {
   if (!TOKEN_REQUIRED) return true;
   const supplied = String(
-    url.searchParams.get('token') || req.headers['x-live-token'] || ''
+    url.searchParams.get('token') || req.headers['x-live-token'] || readCookie(req, TOKEN_COOKIE) || ''
   );
   const a = Buffer.from(supplied);
   const b = Buffer.from(LIVE_TOKEN);
@@ -232,7 +250,12 @@ const server = http.createServer((req, res) => {
       res.writeHead(404);
       return res.end('not found');
     }
-    res.writeHead(200, { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' });
+    const headers = { 'content-type': MIME[path.extname(file)] || 'application/octet-stream' };
+    const presented = url.searchParams.get('token');
+    if (TOKEN_REQUIRED && presented && path.basename(file) === 'index.html') {
+      headers['set-cookie'] = `${TOKEN_COOKIE}=${encodeURIComponent(presented)}; Path=/; SameSite=Lax`;
+    }
+    res.writeHead(200, headers);
     res.end(data);
   });
 });

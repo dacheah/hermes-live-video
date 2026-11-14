@@ -1,6 +1,6 @@
 {
   "name": "hermes-live-video",
-  "version": "1.3.6",
+  "version": "1.3.7",
   "private": true,
   "description": "Phone-camera live voice relay for Hermes Agent: duplex voice, a frame-change tracker, and a verifier-backed watch mode.",
   "main": "server.js",

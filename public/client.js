@@ -7,6 +7,10 @@
   let micWorklet = null;
   let cameraStream = null;
   let frameTimer = null;
+  let lastFrame = '';
+  let frozenFrames = 0;
+  const FROZEN_WARN_AT = 4;        // 4 x 400 ms — a picture that has not moved for 1.6 s
+  const SLOW_FRAME_EVERY = 25;     // keep one frame every 10 s flowing while frozen
   let userHangup = false;
   let facingMode = 'environment';
   let nextPlayTime = 0;
@@ -146,6 +150,8 @@
       }
       if (audioCtx.state === 'suspended') audioCtx.resume().then(flushPendingPlayback).catch(() => {});
       if (micAudioCtx.state === 'suspended') micAudioCtx.resume().catch(() => {});
+      // A paused picture is revived by the same gesture that revives the audio.
+      if (videoEl && cameraStream && videoEl.paused) videoEl.play().catch(() => {});
       if (!audioCtx.onstatechange) {
         // Renewed by any gesture or by the OS: flush whatever arrived meanwhile.
         audioCtx.onstatechange = () => {
@@ -254,6 +260,7 @@
   function captureAndSendFrame() {
     if (!ws || ws.readyState !== WebSocket.OPEN || !cameraStream) return;
     if (videoEl.videoWidth === 0 || videoEl.videoHeight === 0) return;
+    if (videoEl.paused) { videoEl.play().catch(() => {}); }
 
     canvas.width = 640;
     canvas.height = 480;
@@ -264,7 +271,22 @@
       const reader = new FileReader();
       reader.onloadend = () => {
         const b64 = reader.result.split(',')[1];
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (b64 === lastFrame) {
+          frozenFrames += 1;
+        } else {
+          if (overlay && overlay.textContent.startsWith('Camera feed frozen')) overlay.textContent = '';
+          frozenFrames = 0;
+          lastFrame = b64;
+        }
+        // A frozen picture must not be passed off as a live view: stop spending
+        // quota on identical frames, say so on screen, and keep one slow frame
+        // flowing so the session is not silent to the model.
+        if (frozenFrames === FROZEN_WARN_AT && overlay) {
+          overlay.className = 'overlay-status ready';
+          overlay.textContent = 'Camera feed frozen — tap the screen to resume';
+        }
+        const shouldSend = frozenFrames < FROZEN_WARN_AT || frozenFrames % SLOW_FRAME_EVERY === 0;
+        if (shouldSend && ws && ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify({ type: 'image', data: b64 }));
         }
       };
@@ -274,6 +296,8 @@
 
   async function startSession() {
     userHangup = false;
+    lastFrame = '';
+    frozenFrames = 0;
     overlay.textContent = 'Initialising audio & camera...';
     startBtn.textContent = 'Connecting...';
     startBtn.disabled = true;
@@ -303,7 +327,13 @@
       }
       cameraStream = new MediaStream(combined.getVideoTracks());
       micStream = new MediaStream(combined.getAudioTracks());
-      videoEl.srcObject = combined;
+      // Attach the video track alone, and mute the element. A <video> carrying an
+      // audio track is a media element that audio-focus changes can pause: the
+      // picture then freezes on its last frame while the track stays "live", the
+      // canvas keeps drawing that same frame, and the model goes on describing a
+      // room that moved minutes ago.
+      videoEl.srcObject = cameraStream;
+      videoEl.muted = true;
       try { await videoEl.play(); } catch (_) {}
 
       unlockAudioContexts();

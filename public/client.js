@@ -92,6 +92,32 @@
     }
   }
 
+  // The badge must not say "Listening" unless the microphone can actually be
+  // heard. On Android the tab is backgrounded by the permission dialog, which
+  // suspends the capture context; until it is running, speech is not captured at
+  // all — and unlike model audio it cannot be queued and replayed.
+  function micIsLive() {
+    if (!micAudioCtx || micAudioCtx.state !== 'running') return false;
+    const track = micStream ? micStream.getAudioTracks()[0] : null;
+    return Boolean(track && track.readyState === 'live' && !track.muted);
+  }
+
+  function syncMicState() {
+    if (!ws) return;
+    if (micIsLive()) {
+      if (currentState !== 'speaking' && currentState !== 'thinking') updateState('listening', false);
+      return;
+    }
+    currentState = 'ready';
+    if (statusBadge) statusBadge.className = 'badge ready';
+    if (statusText) statusText.textContent = 'Tap for mic';
+    else if (statusBadge) statusBadge.textContent = 'Tap for mic';
+    if (overlay) {
+      overlay.className = 'overlay-status ready';
+      overlay.textContent = 'Tap the screen to enable the microphone';
+    }
+  }
+
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
 
@@ -219,6 +245,9 @@
       } else {
         silentTicks = 0;
       }
+      // Correct the badge every tick, in both directions: "Listening" while the
+      // context is suspended is the lie that costs the user their first sentence.
+      syncMicState();
     }, 5000);
   }
 
@@ -250,14 +279,35 @@
     startBtn.disabled = true;
 
     try {
-      await startCamera();
+      // One getUserMedia for both devices. Two sequential prompts background the
+      // tab twice, and the second suspension is what leaves the capture context
+      // asleep after the user has already started speaking — the first sentence
+      // is then lost with the badge cheerfully reading "Listening".
+      let combined = null;
+      try {
+        combined = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: { ideal: facingMode },
+            width: { ideal: 640 },
+            height: { ideal: 480 },
+            frameRate: { ideal: 15 }
+          },
+          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+        });
+      } catch (err) {
+        console.error('Camera/microphone error:', err);
+        if (overlay) overlay.textContent = 'Camera and microphone permission denied';
+        startBtn.textContent = 'Start Session';
+        startBtn.disabled = false;
+        return;
+      }
+      cameraStream = new MediaStream(combined.getVideoTracks());
+      micStream = new MediaStream(combined.getAudioTracks());
+      videoEl.srcObject = combined;
+      try { await videoEl.play(); } catch (_) {}
 
       unlockAudioContexts();
       if (audioCtx.state === 'suspended') { try { await audioCtx.resume(); } catch (_) {} }
-
-      micStream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
-      });
 
       unlockAudioContexts();
       if (micAudioCtx.state === 'suspended') { try { await micAudioCtx.resume(); } catch (_) {} }
@@ -282,7 +332,7 @@
       ws = new WebSocket(`${proto}//${location.host}/ws${qs}`);
 
       ws.onopen = () => {
-        updateState('listening');
+        syncMicState();
         startBtn.textContent = 'End Call';
         startBtn.className = 'danger';
         startBtn.disabled = false;
